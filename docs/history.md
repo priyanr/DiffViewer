@@ -1,0 +1,47 @@
+# History
+
+## 2026-11-17: ignore line endings (plan: `docs/plans/ignore-eol.md`)
+
+Existing features affected:
+- **Diff (default changed):** diffs ignore CR at the end of lines by default (`git diff --ignore-cr-at-eol`). A
+  file re-saved with other line endings shows only its real edits, or "Only line endings changed." when that is
+  all. Untick "Ignore line endings" in the status bar to see line-ending changes again.
+- **Status bar:** gains the "Ignore line endings" checkbox, left of the highlighter field.
+
+## 2026-11-17: syntax picker, stages 2–5 (plan: `docs/plans/syntax-picker.md`)
+
+Existing features affected:
+- **Diff pane:** files with these extensions are now colored automatically, where before they were plain:
+  C/C++, Go, Java, JavaScript, Kotlin, Rust, TypeScript, Zig, Python, Shell, PowerShell, SQL, YAML, HTML, XML,
+  CSS, JSON. The existing 8 syntax colors are reused; `.cs` files are unchanged.
+- **Status bar highlighter menu:** lists all of them.
+
+## 2026-11-17: word highlighting in changed lines (plan: `docs/plans/word-highlight.md`)
+
+Existing features affected:
+- **Diff pane colors:** on a changed line paired with a similar line (Nth removed with Nth added in a block), the
+  changed words get a stronger green/red background, in both views. Rows keep their usual green/red. Rewritten
+  lines and unpaired lines look as before. Two new theme colors: `added_word_bg`, `removed_word_bg`.
+
+## 2026-11-17: syntax picker, stage 1 (plan: `docs/plans/syntax-picker.md`)
+
+Existing features affected:
+- **Status bar:** the right end shows the open diff's highlighter ("Auto: C#", "Auto: Plain text", or the picked
+  language). Clicking it opens a menu with Auto, Plain text and the languages. A pick lasts for the open file only.
+- **C# highlighting:** moved from `src/cs.c` to `src/syntax.c`; colors and behaviour unchanged.
+
+## 2026-11-17: memory usage in the status bar
+
+Existing features affected:
+- **Status bar:** now ends with the app's private memory (e.g. `· 1.5 MB`), the number Task Manager and the perf
+  gate show. It is read each time the status bar is drawn, so it can be stale while the window sits idle.
+
+## 2026-11-16: stages 3–6 (side by side, C# highlighting, staged/unstaged + refs, auto-refresh)
+
+Existing features affected:
+- **File list (stage 1):** when something is staged, files are grouped under STAGED and UNSTAGED, and a file with
+  both kinds of change is listed twice. Conflicts show `!` instead of `C`.
+- **Diff (stage 2):** an unstaged row now diffs the working tree against the index (`git diff`), not against HEAD;
+  the same as before whenever nothing is staged. "Working tree vs HEAD" is still available: base ref `HEAD`, empty
+  target.
+- **Diff pane:** opens side by side instead of unified; `U` or the top-bar switch returns to unified.

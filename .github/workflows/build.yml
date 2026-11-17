@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install llvm-mingw
+        shell: pwsh
+        run: |
+          $version = "20261104"
+          $name = "llvm-mingw-$version-ucrt-x86_64"
+          Invoke-WebRequest "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$name.zip" -OutFile llvm-mingw.zip
+          Expand-Archive llvm-mingw.zip -DestinationPath $env:RUNNER_TEMP
+          "LLVM_MINGW=$env:RUNNER_TEMP\$name" >> $env:GITHUB_ENV
+
+      - name: Build (warnings are errors)
+        shell: cmd
+        run: build.bat
+
+      # Opens this repo, paints once and prints the numbers. Private memory is the budget the app is held to;
+      # startup time is only reported, because shared runners are too noisy to gate on 100 ms.
+      - name: Memory budget
+        shell: pwsh
+        run: |
+          $line = (.\build\DiffViewer.exe --perf . | Out-String).Trim()
+          Write-Output $line
+          if ($line -notmatch 'private_kb=(\d+)') { throw "no perf output" }
+          $kb = [int]$Matches[1]
+          if ($kb -gt 4096) { throw "private memory $kb KB is over the 4096 KB budget" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DiffViewer
+          path: build/DiffViewer.exe
