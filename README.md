@@ -5,6 +5,8 @@
 A very low-memory, fast git diff viewer for Windows, written in plain C against Win32 and GDI. One small exe, no
 runtime, no installer. Leave it open beside your editor or a coding agent and watch changes arrive.
 
+![DiffViewer showing a side-by-side diff of a C# controller, with the changed file list on the left](screenshot.png)
+
 - Point it at a repo: lists added / modified / deleted / untracked / renamed files.
 - Working tree vs HEAD, staged vs unstaged, and commit/branch vs commit/branch.
 - Side-by-side diff with a toggle to unified, Prev/Next change across files.
