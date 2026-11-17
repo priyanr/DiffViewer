@@ -1,5 +1,24 @@
 # History
 
+## 2026-11-17: find bar, stage 2 of find (plan: `docs/plans/find.md`)
+
+Existing features affected:
+- **Diff pane layout:** while the find bar is open (Ctrl+F) the diff pane is one top-bar height shorter. Closed, nothing changes.
+- **Keys:** Ctrl+F opens the bar, F3 / Shift+F3 step to the next / previous match, Enter / Shift+Enter in the box too,
+  Esc in the box closes it. None of these were used before.
+- **Tab order:** Tab also visits the find box while the bar is open.
+- **Diff pane colors:** while the bar is open, find matches get a background (`find_bg`), the current one a stronger one
+  (`find_current_bg`); a selection is drawn over them. Two new theme colors.
+
+## 2026-11-17: text selection, stage 1 of find (plan: `docs/plans/find.md`)
+
+Existing features affected:
+- **Diff pane mouse:** a click used to only focus the pane; now click sets the caret, drag selects (side by side: only
+  the side where the drag began), double-click selects a word. Ctrl+C copies the selection as text, Ctrl+A selects all.
+- **Selection is cleared** on Unified/Side by side, on a new file and on a reloaded diff (auto-refresh).
+- **Diff pane painting:** each row is drawn into a one-row bitmap and copied over, so repainting while selecting does not
+  flicker. Looks the same otherwise.
+
 ## 2026-11-17: ignore line endings (plan: `docs/plans/ignore-eol.md`)
 
 Existing features affected:

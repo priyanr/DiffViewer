@@ -31,6 +31,7 @@ typedef struct {
     COLORREF added, modified, deleted, untracked, renamed, conflict;
     COLORREF added_bg, removed_bg;
     COLORREF added_word_bg, removed_word_bg;  // changed words inside a changed line
+    COLORREF find_bg, find_current_bg;        // find matches, and the one Prev/Next is on
     COLORREF syntax[8];  // indexed by TOK_*
 } Theme;
 
@@ -41,6 +42,7 @@ static const Theme dark_theme = {
     RGB(244, 135, 113),
     RGB(35, 57, 38), RGB(70, 35, 37),
     RGB(46, 98, 55), RGB(125, 45, 48),
+    RGB(95, 80, 30), RGB(150, 105, 20),
     {RGB(86, 156, 214), RGB(197, 134, 192), RGB(78, 201, 176), RGB(220, 220, 170), RGB(206, 145, 120),
      RGB(181, 206, 168), RGB(106, 153, 85), RGB(155, 155, 155)},
 };
@@ -52,6 +54,7 @@ static const Theme light_theme = {
     RGB(216, 67, 21),
     RGB(218, 251, 225), RGB(255, 235, 233),
     RGB(172, 238, 187), RGB(255, 196, 192),
+    RGB(255, 236, 160), RGB(255, 190, 70),
     {RGB(0, 0, 255), RGB(175, 0, 219), RGB(38, 127, 153), RGB(121, 94, 38), RGB(163, 21, 21),
      RGB(9, 134, 88), RGB(0, 128, 0), RGB(128, 128, 128)},
 };
@@ -60,7 +63,8 @@ static const Theme light_theme = {
 enum { PAD = 8, BAR_H = 40, LIST_W = 340, STATUS_H = 24, REF_W = 150, ARROW_W = 24, TOGGLE_W = 180, NAV_W = 150 };
 enum { SPLIT_W = 5, MIN_LIST_W = 120, MIN_DIFF_W = 200 };  // draggable strip between list and diff
 enum { CHANGE_CONTEXT = 3 };  // rows left above a change that Prev/Next moves to
-enum { EDIT_PATH, EDIT_BASE, EDIT_TARGET, EDIT_COUNT };
+enum { EDIT_PATH, EDIT_BASE, EDIT_TARGET, EDIT_FIND, EDIT_COUNT };
+enum { FIND_COUNT_W = 90, FIND_CLOSE_W = 28 };  // find bar: match count text, close button
 enum { REFS_W = 440, REFS_ROWS = 14 };  // ref dropdown width and most rows shown at once
 enum { LANGUAGE_W = 150, EOL_W = 170 };  // status bar fields at the right end: highlighter, checkbox
 
@@ -77,6 +81,7 @@ static struct {
     HWND edits[EDIT_COUNT];
     RECT frames[EDIT_COUNT];
     RECT toggle, nav;      // [Unified | Side by side], [Prev | Next]
+    RECT find_bar, find_count, find_nav, find_close;  // strip above the diff; all empty while closed
     RECT language_field;   // status bar, right end: opens the highlighter menu
     RECT eol_field;        // status bar, left of language_field: the "Ignore line endings" checkbox
     UINT dpi;
@@ -101,6 +106,14 @@ static struct {
     int change_row;         // first row of the change Prev/Next last moved to, -1 for none
     int change_generation;  // diff request made when Prev/Next crossed to another file
     int change_dir;         // that file then opens on its first (+1) or last (-1) change
+    int find_open;          // the find bar is shown above the diff
+    char find_query[768];   // UTF-8, ASCII lower-cased; matching ignores ASCII case
+    int find_len;
+    int find_line, find_off;  // current match (DiffResult line, byte offset); line -1 for none
+    int find_total, find_index;  // matches in the file; 1-based index of the current one, 0 for none
+    int sel_side;           // side by side: the side (0 old, 1 new) the selection is in
+    int sel_dragging;       // the mouse button is down: moving the mouse extends the selection
+    int sel_anchor_line, sel_anchor_off, sel_caret_line, sel_caret_off;  // DiffResult line + byte; equal = none
     HWND refs_wnd;          // ref dropdown, created on first use
     RefList *refs;          // last ref list read; NULL until the first arrives
     int refs_edit;          // EDIT_BASE / EDIT_TARGET while the dropdown is open, -1 when closed
@@ -302,6 +315,19 @@ static void layout(void)
     app.frames[EDIT_BASE] = (RECT){right - scale(REF_W), pad, right, bar - pad};
     right = app.frames[EDIT_BASE].left - pad;
     app.frames[EDIT_PATH] = (RECT){pad, pad, right > pad ? right : pad, bar - pad};
+
+    int list_w = list_width();
+    if (app.find_open) {
+        // Find bar: [find box ....] count [Prev | Next] [x], in a strip as tall as the top bar above the diff.
+        int x0 = list_w + scale(SPLIT_W), y0 = bar + pad, y1 = 2 * bar - pad;
+        app.find_bar = (RECT){x0, bar, c.right, 2 * bar};
+        app.find_close = (RECT){c.right - pad - scale(FIND_CLOSE_W), y0, c.right - pad, y1};
+        app.find_nav = (RECT){app.find_close.left - pad - scale(NAV_W), y0, app.find_close.left - pad, y1};
+        app.find_count = (RECT){app.find_nav.left - pad - scale(FIND_COUNT_W), y0, app.find_nav.left - pad, y1};
+        app.frames[EDIT_FIND] = (RECT){x0 + pad, y0, app.find_count.left, y1};
+    } else {
+        app.find_bar = app.find_count = app.find_nav = app.find_close = app.frames[EDIT_FIND] = (RECT){0};
+    }
     for (int i = 0; i < EDIT_COUNT; i++) {
         const RECT *f = &app.frames[i];
         int w = f->right - f->left - scale(12);
@@ -313,13 +339,14 @@ static void layout(void)
     app.eol_field = (RECT){app.language_field.left - scale(EOL_W), c.bottom - status, app.language_field.left - pad,
                            c.bottom};
 
-    int list_w = list_width();
     int pane_h = c.bottom - bar - status;
     pane_h = pane_h > 0 ? pane_h : 0;
     MoveWindow(app.list, 0, bar, list_w, pane_h, TRUE);
     int split = scale(SPLIT_W);
     int diff_w = c.right - list_w - split;
-    MoveWindow(app.diff_wnd, list_w + split, bar, diff_w > 0 ? diff_w : 0, pane_h, TRUE);
+    int find_h = app.find_open ? bar : 0;
+    MoveWindow(app.diff_wnd, list_w + split, bar + find_h, diff_w > 0 ? diff_w : 0, pane_h > find_h ? pane_h - find_h : 0,
+               TRUE);
 }
 
 static int row_count(void)
@@ -464,6 +491,38 @@ static int wide_index_after(const char *s, int from, int to, int wide)
     return wide;
 }
 
+// Selection as first..last (line, byte offset); 0 when nothing is selected.
+static int sel_range(int *first_line, int *first_off, int *last_line, int *last_off)
+{
+    int a = app.sel_anchor_line, ao = app.sel_anchor_off, c = app.sel_caret_line, co = app.sel_caret_off;
+    if (a == c && ao == co)
+        return 0;
+    int anchor_first = a < c || (a == c && ao < co);
+    *first_line = anchor_first ? a : c;
+    *first_off = anchor_first ? ao : co;
+    *last_line = anchor_first ? c : a;
+    *last_off = anchor_first ? co : ao;
+    return 1;
+}
+
+// Fills the background behind bytes [from_byte, to_byte) of a line drawn at x; line_text holds its n wide chars.
+static void fill_bytes(HDC dc, const char *s, int len, int n, int from_byte, int to_byte, int x, const RECT *clip,
+                       int tab_w, COLORREF color)
+{
+    if (from_byte >= len)
+        return;
+    int end = to_byte < len ? to_byte : len;
+    int from = wide_index_after(s, 0, from_byte, 0);
+    int to = wide_index_after(s, from_byte, end, from);
+    from = from < n ? from : n;
+    to = to < n ? to : n;
+    RECT mark = {x + (int)LOWORD(GetTabbedTextExtentW(dc, line_text, from, 1, &tab_w)), clip->top,
+                 x + (int)LOWORD(GetTabbedTextExtentW(dc, line_text, to, 1, &tab_w)), clip->bottom};
+    fill(dc, &mark, color);
+}
+
+static int find_in_line(const DiffResult *d, int line, int from, int dir);
+
 // Draws one diff line's text at x (scrolled), clipped to `clip`, highlighted unless it is plain text.
 static void draw_code(HDC dc, const DiffResult *d, int index, int new_side, int x, int y, const RECT *clip)
 {
@@ -489,19 +548,18 @@ static void draw_code(HDC dc, const DiffResult *d, int index, int new_side, int 
             hi = mid;
     }
     COLORREF word_bg = line->kind == LINE_ADDED ? app.theme->added_word_bg : app.theme->removed_word_bg;
-    for (; lo < d->word_span_count && d->word_spans[lo].line == index; lo++) {
-        const WordSpan *w = &d->word_spans[lo];
-        if (w->start >= len)
-            break;
-        int end = w->end < len ? w->end : len;
-        int from = wide_index_after(s, 0, w->start, 0);
-        int to = wide_index_after(s, w->start, end, from);
-        from = from < n ? from : n;
-        to = to < n ? to : n;
-        RECT mark = {x + (int)LOWORD(GetTabbedTextExtentW(dc, line_text, from, 1, &tab_w)), clip->top,
-                     x + (int)LOWORD(GetTabbedTextExtentW(dc, line_text, to, 1, &tab_w)), clip->bottom};
-        fill(dc, &mark, word_bg);
+    for (; lo < d->word_span_count && d->word_spans[lo].line == index; lo++)
+        fill_bytes(dc, s, len, n, d->word_spans[lo].start, d->word_spans[lo].end, x, clip, tab_w, word_bg);
+    if (app.find_open && app.find_len) {
+        for (int m = find_in_line(d, index, 0, 1); m >= 0; m = find_in_line(d, index, m + 1, 1))
+            fill_bytes(dc, s, len, n, m, m + app.find_len, x, clip, tab_w,
+                       index == app.find_line && m == app.find_off ? app.theme->find_current_bg : app.theme->find_bg);
     }
+    int first_line, first_off, last_line, last_off;
+    if (sel_range(&first_line, &first_off, &last_line, &last_off) && index >= first_line && index <= last_line &&
+        (!app.side_by_side || new_side == app.sel_side))
+        fill_bytes(dc, s, len, n, index == first_line ? first_off : 0, index == last_line ? last_off : len, x, clip,
+                   tab_w, app.theme->sel);
     int byte = 0, wide = 0, cx = x;
     // Plain text up to each token, then the token in its color; token offsets are bytes.
     for (int t = 0; t <= count && cx < clip->right; t++) {
@@ -612,25 +670,36 @@ static void diff_paint(HWND hwnd)
     if (!app.side_by_side && first < rows)
         diff_line_numbers(d, first, &old_no, &new_no);
     NumberCursor left_numbers = {-1, 0, 0}, right_numbers = {-1, 0, 0};
-    SelectObject(dc, app.code_font);
     SetBkMode(dc, TRANSPARENT);
 
+    // Each row is drawn in a one-row bitmap and copied over in one go, so a repainted row never shows its
+    // background before its text. The viewport origin lets the row code keep using window coordinates.
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP bitmap = CreateCompatibleBitmap(dc, c.right > 0 ? c.right : 1, app.code_row_h);
+    HGDIOBJ old_bitmap = SelectObject(mem, bitmap);
+    SelectObject(mem, app.code_font);
+    SetBkMode(mem, TRANSPARENT);
     for (int row = first; row < last; row++) {
         RECT r = {0, (row - app.diff_top) * app.code_row_h, c.right, (row - app.diff_top + 1) * app.code_row_h};
         int y = r.top + text_dy;
+        SetViewportOrgEx(mem, 0, -r.top, NULL);
         if (row >= rows) {
-            fill(dc, &r, t->bg);
+            fill(mem, &r, t->bg);
         } else if (app.side_by_side) {
             const SideRow *side = &d->side[row];
-            paint_side_cell(dc, d, side->left, 0, 0, half, r.top, y, &left_numbers);
+            paint_side_cell(mem, d, side->left, 0, 0, half, r.top, y, &left_numbers);
             RECT separator = {half, r.top, half + 1, r.bottom};
-            fill(dc, &separator, t->border);
-            paint_side_cell(dc, d, side->right, 1, half + 1, c.right, r.top, y, &right_numbers);
+            fill(mem, &separator, t->border);
+            paint_side_cell(mem, d, side->right, 1, half + 1, c.right, r.top, y, &right_numbers);
         } else {
-            paint_unified_row(dc, d, row, &r, y, old_no, new_no);
+            paint_unified_row(mem, d, row, &r, y, old_no, new_no);
             diff_advance_numbers(&d->lines[row], &old_no, &new_no);
         }
+        BitBlt(dc, 0, r.top, c.right, app.code_row_h, mem, 0, r.top, SRCCOPY);
     }
+    SelectObject(mem, old_bitmap);
+    DeleteObject(bitmap);
+    DeleteDC(mem);
 
     const wchar_t *message = NULL;
     if (d && d->error[0])
@@ -646,6 +715,324 @@ static void diff_paint(HWND hwnd)
         DrawTextW(dc, message, -1, &r, DT_WORDBREAK | DT_NOPREFIX);
     }
     EndPaint(hwnd, &ps);
+}
+
+// ---- text selection --------------------------------------------------------------------------
+
+static void sel_clear(void)
+{
+    app.sel_caret_line = app.sel_anchor_line;
+    app.sel_caret_off = app.sel_anchor_off;
+}
+
+static int line_bytes(const DiffResult *d, int line)
+{
+    return d->lines[line].kind == LINE_GAP ? 0 : (int)d->lines[line].length;
+}
+
+// Whether the selection takes the text of this line: side by side it only covers the side it started on.
+static int sel_takes_line(const DiffResult *d, int line)
+{
+    int kind = d->lines[line].kind;
+    if (kind == LINE_GAP)
+        return 0;
+    return !app.side_by_side || (app.sel_side ? kind != LINE_REMOVED : kind != LINE_ADDED);
+}
+
+// The line and byte offset under a point of the diff pane. Side by side, the side is the one under the
+// mouse until the button goes down. Returns 0 when the pane has no rows.
+static int diff_hit(int x, int y, int *line, int *off)
+{
+    const DiffResult *d = app.diff;
+    int rows = diff_rows();
+    if (!rows)
+        return 0;
+    int row = app.diff_top + (y < 0 ? -1 : y / app.code_row_h);
+    row = row < 0 ? 0 : row >= rows ? rows - 1 : row;
+    int text_x;
+    if (app.side_by_side) {
+        RECT c;
+        GetClientRect(app.diff_wnd, &c);
+        int half = (c.right - 1) / 2;
+        if (!app.sel_dragging)
+            app.sel_side = x > half;
+        // A filler row has no line on this side: use the nearest one below, else above.
+        *line = -1;
+        for (int r = row; r < rows && *line < 0; r++)
+            *line = app.sel_side ? d->side[r].right : d->side[r].left;
+        for (int r = row; r >= 0 && *line < 0; r--)
+            *line = app.sel_side ? d->side[r].right : d->side[r].left;
+        text_x = (app.sel_side ? half + 1 : 0) + side_text_offset();
+    } else {
+        int old_right, new_right, marker_x;
+        *line = row;
+        text_x = unified_gutter(&old_right, &new_right, &marker_x);
+    }
+    const char *s = d->text + d->lines[*line].offset;
+    int len = line_bytes(d, *line) < 8192 ? line_bytes(d, *line) : 8192;
+    int n = utf8_to_wide(s, len, line_text, 8192);
+    int tab_w = 4 * app.char_w, tx = x - (text_x - app.diff_left);
+
+    // Nearest character boundary: binary search on the drawn width of the first `mid` characters.
+    HDC dc = GetDC(app.diff_wnd);
+    HGDIOBJ old_font = SelectObject(dc, app.code_font);
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if ((int)LOWORD(GetTabbedTextExtentW(dc, line_text, mid, 1, &tab_w)) <= tx)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    if (lo < n) {
+        int w0 = LOWORD(GetTabbedTextExtentW(dc, line_text, lo, 1, &tab_w));
+        int w1 = LOWORD(GetTabbedTextExtentW(dc, line_text, lo + 1, 1, &tab_w));
+        if (tx - w0 > (w1 - w0) / 2)
+            lo++;
+    }
+    SelectObject(dc, old_font);
+    ReleaseDC(app.diff_wnd, dc);
+    if (lo > 0 && lo < n && IS_LOW_SURROGATE(line_text[lo]))
+        lo--;
+
+    // Wide index back to a byte offset.
+    int i = 0;
+    for (int w = 0; i < len && w < lo;) {
+        w += (unsigned char)s[i] >= 0xF0 ? 2 : 1;
+        for (i++; i < len && ((unsigned char)s[i] & 0xC0) == 0x80; i++)
+            ;
+    }
+    *off = i;
+    return 1;
+}
+
+// Identifier characters (and UTF-8 bytes) form one word, a run of blanks another, anything else is alone.
+static int word_class(unsigned char c)
+{
+    if (c == ' ' || c == '\t')
+        return 1;
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c >= 0x80 ? 0 : 2;
+}
+
+static void select_word(int line, int off)
+{
+    const DiffResult *d = app.diff;
+    const char *s = d->text + d->lines[line].offset;
+    int len = line_bytes(d, line) < 8192 ? line_bytes(d, line) : 8192;
+    if (len == 0)
+        return;
+    int a = off < len ? off : len - 1, b = a + 1, cls = word_class((unsigned char)s[a]);
+    if (cls != 2) {
+        while (a > 0 && word_class((unsigned char)s[a - 1]) == cls)
+            a--;
+        while (b < len && word_class((unsigned char)s[b]) == cls)
+            b++;
+    }
+    app.sel_anchor_line = app.sel_caret_line = line;
+    app.sel_anchor_off = a;
+    app.sel_caret_off = b;
+}
+
+static void select_all(void)
+{
+    if (!app.diff || app.diff->line_count == 0)
+        return;
+    app.sel_anchor_line = app.sel_anchor_off = 0;
+    app.sel_caret_line = app.diff->line_count - 1;
+    app.sel_caret_off = line_bytes(app.diff, app.sel_caret_line);
+    InvalidateRect(app.diff_wnd, NULL, FALSE);
+}
+
+static void copy_selection(void)
+{
+    int first_line, first_off, last_line, last_off;
+    if (!sel_range(&first_line, &first_off, &last_line, &last_off))
+        return;
+    const DiffResult *d = app.diff;
+    int cap = 1;  // wide chars never outnumber the bytes; 2 more per line for the line break
+    for (int i = first_line; i <= last_line; i++)
+        cap += line_bytes(d, i) + 2;
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)cap * sizeof(wchar_t));
+    if (!mem)
+        fatal(L"Allocating the clipboard text");
+    wchar_t *out = GlobalLock(mem);
+    int pos = 0;
+    for (int i = first_line; i <= last_line; i++) {
+        if (!sel_takes_line(d, i))
+            continue;
+        const char *s = d->text + d->lines[i].offset;
+        int len = line_bytes(d, i);
+        int from = i == first_line ? first_off : 0, to = i == last_line && last_off < len ? last_off : len;
+        if (to == len && to > from && s[to - 1] == '\r')
+            to--;  // CRLF files: the line break is added below
+        if (pos > 0) {
+            out[pos++] = L'\r';
+            out[pos++] = L'\n';
+        }
+        pos += utf8_to_wide(s + from, to - from, out + pos, cap - pos - 1);
+    }
+    out[pos] = 0;
+    GlobalUnlock(mem);
+    if (OpenClipboard(app.main)) {
+        EmptyClipboard();
+        if (!SetClipboardData(CF_UNICODETEXT, mem))
+            GlobalFree(mem);
+        CloseClipboard();
+    } else {
+        GlobalFree(mem);
+    }
+}
+
+// ---- find ------------------------------------------------------------------------------------
+
+// Match start in `line` at or after byte `from` (dir +1), or before it (dir -1); -1 when there is none.
+static int find_in_line(const DiffResult *d, int line, int from, int dir)
+{
+    const char *s = d->text + d->lines[line].offset;
+    int len = line_bytes(d, line) < 8192 ? line_bytes(d, line) : 8192;
+    int i = dir > 0 ? from : (from - 1 < len - app.find_len ? from - 1 : len - app.find_len);
+    for (; i >= 0 && i + app.find_len <= len; i += dir) {
+        int k = 0;
+        for (; k < app.find_len; k++) {
+            char c = s[i + k];
+            if (c >= 'A' && c <= 'Z')
+                c += 32;
+            if (c != app.find_query[k])
+                break;
+        }
+        if (k == app.find_len)
+            return i;
+    }
+    return -1;
+}
+
+// Total matches and the current one's number: one pass over the file's lines, on a query or diff change or a step.
+static void find_recount(void)
+{
+    const DiffResult *d = app.diff;
+    app.find_total = app.find_index = 0;
+    if (!d || d->error[0] || !app.find_len)
+        return;
+    for (int line = 0; line < d->line_count; line++) {
+        for (int m = find_in_line(d, line, 0, 1); m >= 0; m = find_in_line(d, line, m + 1, 1)) {
+            app.find_total++;
+            if (line == app.find_line && m == app.find_off)
+                app.find_index = app.find_total;
+        }
+    }
+}
+
+// The row of the current view that shows `line`.
+static int row_of_line(int line)
+{
+    if (!app.side_by_side)
+        return line;
+    const DiffResult *d = app.diff;
+    for (int i = 0; i < d->side_count; i++) {
+        if (d->side[i].left == line || d->side[i].right == line)
+            return i;
+    }
+    return 0;
+}
+
+// Moves to the next (dir +1) or previous (-1) match, wrapping around; from the top of the screen when
+// there is no current match. Returns 0 when there is no match at all.
+static int find_step(int dir)
+{
+    const DiffResult *d = app.diff;
+    int rows = diff_rows(), n = d ? d->line_count : 0;
+    if (!app.find_len || rows == 0 || n == 0)
+        return 0;
+    int line, off;
+    if (app.find_line >= 0) {
+        line = app.find_line;
+        off = dir > 0 ? app.find_off + 1 : app.find_off;
+    } else {
+        int top = app.diff_top < rows ? app.diff_top : rows - 1;
+        line = app.side_by_side ? (d->side[top].left >= 0 ? d->side[top].left : d->side[top].right) : top;
+        off = 0;
+    }
+    // k = n visits the starting line again, for its matches on the far side of the current one.
+    for (int k = 0; k <= n; k++) {
+        int i = ((line + dir * k) % n + n) % n;
+        int m = find_in_line(d, i, k == 0 ? off : dir > 0 ? 0 : 0x7FFFFFFF, dir);
+        if (m < 0)
+            continue;
+        app.find_line = i;
+        app.find_off = m;
+        // Put the match a third of the way down; scroll sideways only if it is out of view.
+        RECT c;
+        GetClientRect(app.diff_wnd, &c);
+        int old_right, new_right, marker_x;
+        int text_x = app.side_by_side ? side_text_offset() : unified_gutter(&old_right, &new_right, &marker_x);
+        int text_w = (app.side_by_side ? (c.right - 1) / 2 : c.right) - text_x;
+        int x = m * app.char_w, left = app.diff_left;
+        if (x < left || x + app.find_len * app.char_w > left + text_w)
+            left = x - text_w / 4;
+        diff_scroll_to(row_of_line(i) - diff_visible_rows() / 3, left);
+        return 1;
+    }
+    return 0;
+}
+
+static void find_query_changed(void)
+{
+    wchar_t text[256];
+    int n = GetWindowTextW(app.edits[EDIT_FIND], text, 256);
+    app.find_len = n ? WideCharToMultiByte(CP_UTF8, 0, text, n, app.find_query, sizeof app.find_query, NULL, NULL) : 0;
+    for (int i = 0; i < app.find_len; i++) {
+        if (app.find_query[i] >= 'A' && app.find_query[i] <= 'Z')
+            app.find_query[i] += 32;
+    }
+    app.find_line = -1;
+    find_step(1);
+    find_recount();
+    InvalidateRect(app.main, &app.find_bar, FALSE);
+    InvalidateRect(app.diff_wnd, NULL, FALSE);
+}
+
+// Opens the bar (or just refocuses it). A selection on one line becomes the query.
+static void find_show(void)
+{
+    int first_line, first_off, last_line, last_off;
+    if (sel_range(&first_line, &first_off, &last_line, &last_off) && first_line == last_line) {
+        wchar_t seed[256];
+        int bytes = last_off - first_off < 255 ? last_off - first_off : 255;
+        int n = utf8_to_wide(app.diff->text + app.diff->lines[first_line].offset + first_off, bytes, seed, 255);
+        seed[n] = 0;
+        SetWindowTextW(app.edits[EDIT_FIND], seed);  // EN_CHANGE runs the search
+    }
+    if (!app.find_open) {
+        app.find_open = 1;
+        ShowWindow(app.edits[EDIT_FIND], SW_SHOW);
+        layout();
+        find_recount();
+        InvalidateRect(app.main, NULL, FALSE);
+    }
+    SetFocus(app.edits[EDIT_FIND]);
+    SendMessageW(app.edits[EDIT_FIND], EM_SETSEL, 0, -1);
+}
+
+static void find_hide(void)
+{
+    app.find_open = 0;
+    ShowWindow(app.edits[EDIT_FIND], SW_HIDE);
+    layout();
+    InvalidateRect(app.main, NULL, FALSE);
+    SetFocus(app.diff_wnd);
+}
+
+// Prev/Next buttons, Enter and F3. Without a query there is nothing to step through: show the bar.
+static void find_next(int dir)
+{
+    if (!app.find_len) {
+        find_show();
+        return;
+    }
+    find_step(dir);
+    find_recount();
+    InvalidateRect(app.main, &app.find_bar, FALSE);
+    InvalidateRect(app.diff_wnd, NULL, FALSE);
 }
 
 // The row of the other view (unified <-> side by side) that shows the same line as `row` here.
@@ -675,6 +1062,7 @@ static void toggle_view(void)
             app.change_row = other_view_row(app.change_row);
     }
     app.side_by_side = !app.side_by_side;
+    sel_clear();
     diff_scroll_to(top, app.diff_left);
     InvalidateRect(app.main, &app.toggle, FALSE);
 }
@@ -770,10 +1158,59 @@ static LRESULT CALLBACK diff_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: {
         SetFocus(hwnd);
+        int line, off;
+        app.sel_dragging = 0;
+        sel_clear();
+        if (diff_hit((short)LOWORD(lp), (short)HIWORD(lp), &line, &off)) {
+            if (msg == WM_LBUTTONDBLCLK) {
+                select_word(line, off);
+            } else {
+                app.sel_anchor_line = app.sel_caret_line = line;
+                app.sel_anchor_off = app.sel_caret_off = off;
+                app.sel_dragging = 1;
+                SetCapture(hwnd);
+            }
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (app.sel_dragging) {
+            RECT c;
+            GetClientRect(hwnd, &c);
+            int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+            if (y < 0)
+                diff_scroll_to(app.diff_top - 1, app.diff_left);
+            else if (y >= c.bottom)
+                diff_scroll_to(app.diff_top + 1, app.diff_left);
+            int old_line = app.sel_caret_line, old_off = app.sel_caret_off;
+            if (diff_hit(x, y, &app.sel_caret_line, &app.sel_caret_off) &&
+                (app.sel_caret_line != old_line || app.sel_caret_off != old_off)) {
+                // Repaint only the rows between the old and new end: repainting every row flickers.
+                int a = row_of_line(old_line), b = row_of_line(app.sel_caret_line);
+                RECT dirty = {0, ((a < b ? a : b) - app.diff_top) * app.code_row_h, c.right,
+                              ((a < b ? b : a) + 1 - app.diff_top) * app.code_row_h};
+                InvalidateRect(hwnd, &dirty, FALSE);
+            }
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        ReleaseCapture();
+        return 0;
+    case WM_CAPTURECHANGED:
+        app.sel_dragging = 0;
         return 0;
     case WM_KEYDOWN: {
         int visible = diff_visible_rows();
+        if (GetKeyState(VK_CONTROL) < 0 && (wp == 'C' || wp == 'A')) {
+            if (wp == 'C')
+                copy_selection();
+            else
+                select_all();
+            return 0;
+        }
         switch (wp) {
         case VK_UP: diff_scroll_to(app.diff_top - 1, app.diff_left); break;
         case VK_DOWN: diff_scroll_to(app.diff_top + 1, app.diff_left); break;
@@ -1018,11 +1455,15 @@ static LRESULT CALLBACK list_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 // Tab order: path, base ref, target ref, file list, diff.
 static void move_focus(HWND from, int backwards)
 {
-    HWND order[] = {app.edits[EDIT_PATH], app.edits[EDIT_BASE], app.edits[EDIT_TARGET], app.list, app.diff_wnd};
+    HWND order[] = {app.edits[EDIT_PATH], app.edits[EDIT_BASE], app.edits[EDIT_TARGET], app.edits[EDIT_FIND],
+                    app.list, app.diff_wnd};
     int n = sizeof order / sizeof *order, i = 0;
     while (i < n && order[i] != from)
         i++;
-    SetFocus(order[(i + (backwards ? n - 1 : 1)) % n]);
+    do
+        i = (i + (backwards ? n - 1 : 1)) % n;
+    while (!IsWindowVisible(order[i]));  // the find box is hidden while the bar is closed
+    SetFocus(order[i]);
 }
 
 static void read_edit(int which, wchar_t *out, int cap)
@@ -1356,6 +1797,16 @@ static LRESULT CALLBACK edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             refs_open(ref_box);
             return 0;
         }
+        if (hwnd == app.edits[EDIT_FIND]) {
+            if (wp == VK_ESCAPE) {
+                find_hide();
+                return 0;
+            }
+            if (wp == VK_RETURN) {
+                find_next(GetKeyState(VK_SHIFT) < 0 ? -1 : 1);
+                return 0;
+            }
+        }
         if (wp == VK_RETURN) {
             reload();
             return 0;
@@ -1475,6 +1926,7 @@ static void main_paint(HWND hwnd)
     int bar = scale(BAR_H), status_h = scale(STATUS_H);
     RECT top = {0, 0, c.right, bar};
     fill(dc, &top, t->bg);
+    fill(dc, &app.find_bar, t->bg);
     for (int i = 0; i < EDIT_COUNT; i++) {
         FillRect(dc, &app.frames[i], app.edit_brush);
         FrameRect(dc, &app.frames[i], app.border_brush);
@@ -1487,6 +1939,20 @@ static void main_paint(HWND hwnd)
     DrawTextW(dc, L"\x2192", 1, &arrow, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     paint_pair(dc, &app.nav, L"\x25B2  Prev", L"\x25BC  Next", -1);
     paint_pair(dc, &app.toggle, L"Unified", L"Side by side", app.side_by_side);
+    if (app.find_open) {
+        wchar_t count[32];
+        count[0] = 0;
+        if (app.find_total)
+            wsprintfW(count, L"%d / %d", app.find_index, app.find_total);
+        else if (app.find_len)
+            lstrcpyW(count, L"No results");
+        DrawTextW(dc, count, -1, &app.find_count, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        paint_pair(dc, &app.find_nav, L"\x25B2  Prev", L"\x25BC  Next", -1);
+        FillRect(dc, &app.find_close, app.edit_brush);
+        FrameRect(dc, &app.find_close, app.border_brush);
+        SetTextColor(dc, t->fg);
+        DrawTextW(dc, L"\x00D7", 1, &app.find_close, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
 
     RECT split = split_rect();
     fill(dc, &split, t->bg);
@@ -1550,6 +2016,9 @@ static void clear_diff(void)
     if (app.diff)
         diff_free(app.diff);
     app.diff = NULL;
+    sel_clear();
+    app.find_line = -1;
+    find_recount();
     app.diff_generation++;  // a diff still loading for the old list is dropped when it arrives
     diff_scroll_to(0, 0);
 }
@@ -1607,6 +2076,9 @@ static void on_diff(DiffResult *r)
     if (app.diff)
         diff_free(app.diff);
     app.diff = r;
+    sel_clear();
+    app.find_line = -1;
+    find_recount();
     app.change_row = -1;
     if (r->generation == app.change_generation) {
         int row = find_change(app.change_dir > 0 ? -1 : diff_rows(), app.change_dir);
@@ -1641,6 +2113,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             edit_proc_original = (WNDPROC)SetWindowLongPtrW(app.edits[i], GWLP_WNDPROC, (LONG_PTR)edit_proc);
             SendMessageW(app.edits[i], WM_SETFONT, (WPARAM)app.ui_font, FALSE);
         }
+        ShowWindow(app.edits[EDIT_FIND], SW_HIDE);
         app.list = CreateWindowExW(0, L"DiffViewerList", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL,
                                    0, 0, 0, 0, hwnd, NULL, inst, NULL);
         app.diff_wnd = CreateWindowExW(0, L"DiffViewerDiff", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL,
@@ -1657,6 +2130,8 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         refs_hide();  // it would stay where the box was
         return 0;
     case WM_COMMAND: {
+        if (HIWORD(wp) == EN_CHANGE && (HWND)lp == app.edits[EDIT_FIND])
+            find_query_changed();
         // Typing in a ref box opens the dropdown and filters it.
         int which = (HWND)lp == app.edits[EDIT_BASE] ? EDIT_BASE : (HWND)lp == app.edits[EDIT_TARGET] ? EDIT_TARGET : -1;
         if (HIWORD(wp) == EN_CHANGE && which >= 0 && !app.refs_setting_text && GetFocus() == (HWND)lp) {
@@ -1681,6 +2156,10 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             toggle_view();
         if (PtInRect(&app.nav, p))
             goto_change(p.x >= (app.nav.left + app.nav.right) / 2 ? 1 : -1);
+        if (PtInRect(&app.find_nav, p))
+            find_next(p.x >= (app.find_nav.left + app.find_nav.right) / 2 ? 1 : -1);
+        if (PtInRect(&app.find_close, p))
+            find_hide();
         if (PtInRect(&app.language_field, p) && language_field_shown())
             language_menu();
         if (PtInRect(&app.eol_field, p) && app.status && app.status->root[0]) {
@@ -1806,7 +2285,7 @@ static int run(void)
     HCURSOR arrow = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     WNDCLASSW main_class = {0, main_proc, 0, 0, inst, NULL, arrow, NULL, NULL, L"DiffViewer"};
     WNDCLASSW list_class = {0, list_proc, 0, 0, inst, NULL, arrow, NULL, NULL, L"DiffViewerList"};
-    WNDCLASSW diff_class = {0, diff_proc, 0, 0, inst, NULL, LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM), NULL, NULL,
+    WNDCLASSW diff_class = {CS_DBLCLKS, diff_proc, 0, 0, inst, NULL, LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM), NULL, NULL,
                             L"DiffViewerDiff"};
     WNDCLASSW refs_class = {CS_DROPSHADOW, refs_proc, 0, 0, inst, NULL, arrow, NULL, NULL, L"DiffViewerRefs"};
     if (!RegisterClassW(&main_class) || !RegisterClassW(&list_class) || !RegisterClassW(&diff_class) ||
@@ -1834,6 +2313,15 @@ static int run(void)
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        // Focus can be in any pane or box, so these two keys are caught here.
+        if (msg.message == WM_KEYDOWN && msg.wParam == 'F' && GetKeyState(VK_CONTROL) < 0) {
+            find_show();
+            continue;
+        }
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_F3) {
+            find_next(GetKeyState(VK_SHIFT) < 0 ? -1 : 1);
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
