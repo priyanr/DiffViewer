@@ -16,8 +16,9 @@ jobs:
         run: |
           $version = "20261104"
           $name = "llvm-mingw-$version-ucrt-x86_64"
-          Invoke-WebRequest "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$name.zip" -OutFile llvm-mingw.zip
-          Expand-Archive llvm-mingw.zip -DestinationPath $env:RUNNER_TEMP
+          $zip = "$env:RUNNER_TEMP\llvm-mingw.zip"  # outside the checkout: --perf below lists this repo's changes
+          Invoke-WebRequest "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$name.zip" -OutFile $zip
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
           "LLVM_MINGW=$env:RUNNER_TEMP\$name" >> $env:GITHUB_ENV
 
       - name: Build (warnings are errors)
