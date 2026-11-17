@@ -3,7 +3,16 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+
+# A newer push to the same branch or tag replaces a run still in progress, so two runs never race to publish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write  # publishing releases
 
 jobs:
   build:
@@ -35,8 +44,33 @@ jobs:
           if ($line -notmatch 'private_kb=(\d+)') { throw "no perf output" }
           $kb = [int]$Matches[1]
           if ($kb -gt 4096) { throw "private memory $kb KB is over the 4096 KB budget" }
+          "PERF_LINE=$line" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:
           name: DiffViewer
           path: build/DiffViewer.exe
+
+      # Every push to main replaces the one rolling "Latest build" pre-release.
+      - name: Publish "Latest build"
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $hash = (Get-FileHash build\DiffViewer.exe -Algorithm SHA256).Hash
+          $subject = git log -1 --format=%s
+          $notes = "Built from $env:GITHUB_SHA on main: $subject`n`nSHA-256 of DiffViewer.exe: ``$hash```n`n``$env:PERF_LINE``"
+          gh release delete latest --yes --cleanup-tag 2>$null
+          $global:LASTEXITCODE = 0  # there is no "latest" release on the first run
+          gh release create latest build\DiffViewer.exe --prerelease --target $env:GITHUB_SHA --title "Latest build" --notes $notes
+
+      # Pushing a tag such as v1.0.0 makes a permanent release, with notes from the commits since the last tag.
+      - name: Publish version release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $hash = (Get-FileHash build\DiffViewer.exe -Algorithm SHA256).Hash
+          gh release create $env:GITHUB_REF_NAME build\DiffViewer.exe --verify-tag --title "DiffViewer $env:GITHUB_REF_NAME" --generate-notes --notes "SHA-256 of DiffViewer.exe: ``$hash``"

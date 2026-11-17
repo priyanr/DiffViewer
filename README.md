@@ -21,9 +21,12 @@ it uses about 1.4 MB and paints in about 50 ms. The status bar shows its current
 
 ## Download
 
-Each push to `main` builds `DiffViewer.exe` in CI: open the latest
-[build run](https://github.com/priyanr/DiffViewer/actions/workflows/build.yml) and download the `DiffViewer`
-artifact. Needs Windows 10 or later and `git` on PATH.
+Get `DiffViewer.exe` from the [Releases page](https://github.com/priyanr/DiffViewer/releases):
+
+- **Versioned releases** (`v1.0.0`, ...) are the stable builds.
+- **Latest build** is a pre-release rebuilt from every push to `main`.
+
+Each release lists the exe's SHA-256. Needs Windows 10 or later and `git` on PATH.
 
 ```
 DiffViewer.exe C:\path\to\repo
@@ -43,6 +46,13 @@ build\DiffViewer.exe C:\path\to\repo
 `build.bat` is the only build: one `clang` call, warnings are errors, no C runtime (own entry point, system DLLs
 only). `build\DiffViewer.exe --perf <repo>` opens the repo, paints once, prints
 `private_kb=… peak_ws_kb=… startup_ms=…` and exits. CI runs it and fails over 4 MB of private memory.
+
+To publish a version, tag a commit on `main` and push the tag; CI builds it and creates the release:
+
+```
+git tag v1.0.0
+git push origin v1.0.0
+```
 
 ## Use
 
