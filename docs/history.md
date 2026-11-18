@@ -1,5 +1,24 @@
 # History
 
+## 2026-11-18: resizable side-by-side halves, stage 2 of full-fit (plan: `docs/plans/full-fit.md`)
+
+Existing features affected:
+- **Side-by-side mouse:** the line between the halves can be dragged (cursor ↔ within a few pixels of it); a press
+  there drags instead of starting a selection, and a double-click resets 50/50 instead of selecting a word. Dragging
+  a half narrower than 60 px (96 DPI) collapses it, so the other side fills the pane.
+- **Keys:** Ctrl+1 shows only the old side, Ctrl+2 only the new side, Ctrl+0 both at 50/50. Unused before; they do
+  nothing in Unified.
+- **Side-by-side horizontal scroll:** the page size is the wider half (was exactly half).
+- The split is a share of the pane, so it follows window resizes. Not saved across restarts.
+
+## 2026-11-18: hide the file list, stage 1 of full-fit (plan: `docs/plans/full-fit.md`)
+
+Existing features affected:
+- **Top bar layout:** a small button at the far left (`«` / `»`) hides and shows the file list; the path box starts
+  one button-width further right.
+- **Keys:** F11 does the same from anywhere. It was unused before.
+- **Tab order:** while the list is hidden, Tab skips it. If the list had focus, focus moves to the diff.
+
 ## 2026-11-17: find bar, stage 2 of find (plan: `docs/plans/find.md`)
 
 Existing features affected:

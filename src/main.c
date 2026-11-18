@@ -62,6 +62,7 @@ static const Theme light_theme = {
 // Layout sizes at 96 DPI.
 enum { PAD = 8, BAR_H = 40, LIST_W = 340, STATUS_H = 24, REF_W = 150, ARROW_W = 24, TOGGLE_W = 180, NAV_W = 150 };
 enum { SPLIT_W = 5, MIN_LIST_W = 120, MIN_DIFF_W = 200 };  // draggable strip between list and diff
+enum { MIN_SIDE_W = 60 };  // side by side: a half dragged narrower than this collapses
 enum { CHANGE_CONTEXT = 3 };  // rows left above a change that Prev/Next moves to
 enum { EDIT_PATH, EDIT_BASE, EDIT_TARGET, EDIT_FIND, EDIT_COUNT };
 enum { FIND_COUNT_W = 90, FIND_CLOSE_W = 28 };  // find bar: match count text, close button
@@ -84,6 +85,7 @@ static struct {
     RECT find_bar, find_count, find_nav, find_close;  // strip above the diff; all empty while closed
     RECT language_field;   // status bar, right end: opens the highlighter menu
     RECT eol_field;        // status bar, left of language_field: the "Ignore line endings" checkbox
+    RECT list_button;      // top bar, far left: hides / shows the file list
     UINT dpi;
     const Theme *theme;
     HFONT ui_font, bold_font, code_font;
@@ -96,12 +98,15 @@ static struct {
     int sel, top, wheel_rest;
     int list_w96;          // file list width at 96 DPI, set by dragging the split
     int drag_dx;           // while dragging the split: mouse x minus list width; -1 otherwise
+    int list_hidden;       // the file list is hidden and the diff takes the full width
     DiffResult *diff;      // NULL until the selected file's diff arrives
     int diff_generation;
     int keep_scroll_generation;  // a diff reloaded by auto-refresh keeps its scroll position
     int language_pick;     // LANG_AUTO, or the highlighter picked in the menu for the open file
     int ignore_eol;        // diffs ignore CR at the end of lines (git diff --ignore-cr-at-eol)
     int side_by_side;
+    int side_split;         // side by side: the old half's share of the pane in per-mille; 0 or 1000 = one side only
+    int side_dragging;      // the divider between the halves is being dragged
     int diff_top, diff_left, diff_wheel_rest;
     int change_row;         // first row of the change Prev/Next last moved to, -1 for none
     int change_generation;  // diff request made when Prev/Next crossed to another file
@@ -280,6 +285,8 @@ static void make_fonts(void)
 
 static int list_width(void)
 {
+    if (app.list_hidden)
+        return 0;
     RECT c;
     GetClientRect(app.main, &c);
     int w = scale(app.list_w96), max = c.right - scale(SPLIT_W) - scale(MIN_DIFF_W);
@@ -292,6 +299,8 @@ static int list_width(void)
 
 static RECT split_rect(void)
 {
+    if (app.list_hidden)
+        return (RECT){0};
     RECT c;
     GetClientRect(app.main, &c);
     int x = list_width();
@@ -304,7 +313,8 @@ static void layout(void)
     GetClientRect(app.main, &c);
     int bar = scale(BAR_H), status = scale(STATUS_H), pad = scale(PAD);
 
-    // Top bar: [path ........] [base] -> [target] [Prev | Next] [Unified | Side by side]
+    // Top bar: [<<] [path ........] [base] -> [target] [Prev | Next] [Unified | Side by side]
+    app.list_button = (RECT){pad, pad, bar - pad, bar - pad};
     int right = c.right - pad;
     app.toggle = (RECT){right - scale(TOGGLE_W), pad, right, bar - pad};
     right = app.toggle.left - pad;
@@ -314,12 +324,13 @@ static void layout(void)
     right = app.frames[EDIT_TARGET].left - scale(ARROW_W);
     app.frames[EDIT_BASE] = (RECT){right - scale(REF_W), pad, right, bar - pad};
     right = app.frames[EDIT_BASE].left - pad;
-    app.frames[EDIT_PATH] = (RECT){pad, pad, right > pad ? right : pad, bar - pad};
+    int path_left = app.list_button.right + pad;
+    app.frames[EDIT_PATH] = (RECT){path_left, pad, right > path_left ? right : path_left, bar - pad};
 
-    int list_w = list_width();
+    int list_w = list_width(), split = app.list_hidden ? 0 : scale(SPLIT_W);
     if (app.find_open) {
         // Find bar: [find box ....] count [Prev | Next] [x], in a strip as tall as the top bar above the diff.
-        int x0 = list_w + scale(SPLIT_W), y0 = bar + pad, y1 = 2 * bar - pad;
+        int x0 = list_w + split, y0 = bar + pad, y1 = 2 * bar - pad;
         app.find_bar = (RECT){x0, bar, c.right, 2 * bar};
         app.find_close = (RECT){c.right - pad - scale(FIND_CLOSE_W), y0, c.right - pad, y1};
         app.find_nav = (RECT){app.find_close.left - pad - scale(NAV_W), y0, app.find_close.left - pad, y1};
@@ -342,7 +353,7 @@ static void layout(void)
     int pane_h = c.bottom - bar - status;
     pane_h = pane_h > 0 ? pane_h : 0;
     MoveWindow(app.list, 0, bar, list_w, pane_h, TRUE);
-    int split = scale(SPLIT_W);
+    ShowWindow(app.list, app.list_hidden ? SW_HIDE : SW_SHOW);
     int diff_w = c.right - list_w - split;
     int find_h = app.find_open ? bar : 0;
     MoveWindow(app.diff_wnd, list_w + split, bar + find_h, diff_w > 0 ? diff_w : 0, pane_h > find_h ? pane_h - find_h : 0,
@@ -443,6 +454,19 @@ static int side_text_offset(void)
     return scale(8) + line_number_width() + scale(10);
 }
 
+// Side by side, in a pane `width` wide: old cell [0, x), separator [x, x + 1), new cell [x + 1, width).
+static int side_divider_x(int width)
+{
+    return MulDiv(width - 1, app.side_split, 1000);
+}
+
+// The wider half: the page width for horizontal scrolling.
+static int side_page_width(int width)
+{
+    int x = side_divider_x(width);
+    return x > width - 1 - x ? x : width - 1 - x;
+}
+
 static int diff_visible_rows(void)
 {
     RECT c;
@@ -460,7 +484,7 @@ static void diff_scroll_to(int top, int left)
         top = rows - visible;
     if (top < 0)
         top = 0;
-    int page = app.side_by_side ? (c.right - 1) / 2 : c.right;
+    int page = app.side_by_side ? side_page_width(c.right) : c.right;
     int width = 0;
     if (rows) {
         int old_right, new_right, marker_x;
@@ -634,6 +658,8 @@ static void paint_side_cell(HDC dc, const DiffResult *d, int index, int new_side
 {
     const Theme *t = app.theme;
     RECT cell = {x0, top, x1, top + app.code_row_h};
+    if (x1 <= x0)
+        return;  // collapsed side: its line number would land on the other side
     if (index < 0) {
         fill(dc, &cell, t->panel);  // filler opposite a block of added or removed lines
         return;
@@ -665,7 +691,7 @@ static void diff_paint(HWND hwnd)
     int first = app.diff_top + ps.rcPaint.top / app.code_row_h;
     int last = app.diff_top + (ps.rcPaint.bottom + app.code_row_h - 1) / app.code_row_h;
     int text_dy = (app.code_row_h - app.code_h) / 2;
-    int half = (c.right - 1) / 2;
+    int half = side_divider_x(c.right);
     unsigned old_no = 0, new_no = 0;
     if (!app.side_by_side && first < rows)
         diff_line_numbers(d, first, &old_no, &new_no);
@@ -753,9 +779,9 @@ static int diff_hit(int x, int y, int *line, int *off)
     if (app.side_by_side) {
         RECT c;
         GetClientRect(app.diff_wnd, &c);
-        int half = (c.right - 1) / 2;
+        int half = side_divider_x(c.right);
         if (!app.sel_dragging)
-            app.sel_side = x > half;
+            app.sel_side = app.side_split == 0 || (app.side_split < 1000 && x > half);
         // A filler row has no line on this side: use the nearest one below, else above.
         *line = -1;
         for (int r = row; r < rows && *line < 0; r++)
@@ -965,7 +991,7 @@ static int find_step(int dir)
         GetClientRect(app.diff_wnd, &c);
         int old_right, new_right, marker_x;
         int text_x = app.side_by_side ? side_text_offset() : unified_gutter(&old_right, &new_right, &marker_x);
-        int text_w = (app.side_by_side ? (c.right - 1) / 2 : c.right) - text_x;
+        int text_w = (app.side_by_side ? side_page_width(c.right) : c.right) - text_x;
         int x = m * app.char_w, left = app.diff_left;
         if (x < left || x + app.find_len * app.char_w > left + text_w)
             left = x - text_w / 4;
@@ -1120,6 +1146,26 @@ static void goto_change(int dir)
         app.change_generation = 0;  // already at the first/last file
 }
 
+// Side by side: whether pane x is on the divider between the halves (a few pixels either side of the line).
+static int on_side_divider(int x)
+{
+    RECT c;
+    GetClientRect(app.diff_wnd, &c);
+    int d = x - side_divider_x(c.right);
+    return app.side_by_side && d >= -scale(3) && d <= scale(3);
+}
+
+// Ctrl+0/1/2 and double-click on the divider: 500 = halves, 1000 = old only, 0 = new only.
+static void set_side_split(int per_mille)
+{
+    if (!app.side_by_side)
+        return;
+    app.side_split = per_mille;
+    if ((per_mille == 0 && !app.sel_side) || (per_mille == 1000 && app.sel_side))
+        sel_clear();  // the selected side is no longer shown
+    diff_scroll_to(app.diff_top, app.diff_left);
+}
+
 static void move_focus(HWND from, int backwards);
 
 static LRESULT CALLBACK diff_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -1160,6 +1206,15 @@ static LRESULT CALLBACK diff_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
         SetFocus(hwnd);
+        if (on_side_divider((short)LOWORD(lp))) {
+            if (msg == WM_LBUTTONDBLCLK) {
+                set_side_split(500);
+            } else {
+                app.side_dragging = 1;
+                SetCapture(hwnd);
+            }
+            return 0;
+        }
         int line, off;
         app.sel_dragging = 0;
         sel_clear();
@@ -1177,6 +1232,14 @@ static LRESULT CALLBACK diff_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_MOUSEMOVE:
+        if (app.side_dragging) {
+            RECT c;
+            GetClientRect(hwnd, &c);
+            int x = (short)LOWORD(lp), min = scale(MIN_SIDE_W);
+            int split = x < min ? 0 : x > c.right - 1 - min ? 1000 : MulDiv(x, 1000, c.right - 1);
+            if (split != app.side_split)
+                set_side_split(split);
+        }
         if (app.sel_dragging) {
             RECT c;
             GetClientRect(hwnd, &c);
@@ -1201,7 +1264,18 @@ static LRESULT CALLBACK diff_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_CAPTURECHANGED:
         app.sel_dragging = 0;
+        app.side_dragging = 0;
         return 0;
+    case WM_SETCURSOR: {
+        POINT p;
+        GetCursorPos(&p);
+        ScreenToClient(hwnd, &p);
+        if (LOWORD(lp) == HTCLIENT && on_side_divider(p.x)) {
+            SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_SIZEWE));
+            return TRUE;
+        }
+        break;
+    }
     case WM_KEYDOWN: {
         int visible = diff_visible_rows();
         if (GetKeyState(VK_CONTROL) < 0 && (wp == 'C' || wp == 'A')) {
@@ -1890,6 +1964,16 @@ static void reload_diff(void)
     git_request_diff(app.status, &app.status->rows[app.sel], ++app.diff_generation, app.language_pick, app.ignore_eol);
 }
 
+// Button and F11: hides the file list so the diff takes the full width, or brings it back.
+static void toggle_list(void)
+{
+    app.list_hidden = !app.list_hidden;
+    if (app.list_hidden && GetFocus() == app.list)
+        SetFocus(app.diff_wnd);
+    layout();
+    InvalidateRect(app.main, NULL, FALSE);
+}
+
 static int language_field_shown(void)
 {
     return !app.loading && app.diff && !app.diff->error[0] && !app.diff->binary;
@@ -1937,6 +2021,10 @@ static void main_paint(HWND hwnd)
     RECT arrow = {app.frames[EDIT_BASE].right, app.frames[EDIT_BASE].top, app.frames[EDIT_TARGET].left,
                   app.frames[EDIT_BASE].bottom};
     DrawTextW(dc, L"\x2192", 1, &arrow, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    FillRect(dc, &app.list_button, app.edit_brush);
+    FrameRect(dc, &app.list_button, app.border_brush);
+    SetTextColor(dc, t->fg);
+    DrawTextW(dc, app.list_hidden ? L"\x00BB" : L"\x00AB", 1, &app.list_button, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     paint_pair(dc, &app.nav, L"\x25B2  Prev", L"\x25BC  Next", -1);
     paint_pair(dc, &app.toggle, L"Unified", L"Side by side", app.side_by_side);
     if (app.find_open) {
@@ -2152,6 +2240,8 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN: {
         refs_hide();
         POINT p = {(short)LOWORD(lp), (short)HIWORD(lp)};
+        if (PtInRect(&app.list_button, p))
+            toggle_list();
         if (PtInRect(&app.toggle, p) && (p.x >= (app.toggle.left + app.toggle.right) / 2) != app.side_by_side)
             toggle_view();
         if (PtInRect(&app.nav, p))
@@ -2295,6 +2385,7 @@ static int run(void)
     app.loading = 1;
     app.sel = -1;
     app.side_by_side = 1;
+    app.side_split = 500;
     app.change_row = -1;
     app.list_w96 = LIST_W;
     app.ignore_eol = 1;
@@ -2313,7 +2404,15 @@ static int run(void)
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
-        // Focus can be in any pane or box, so these two keys are caught here.
+        // Focus can be in any pane or box, so these keys are caught here.
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_F11) {
+            toggle_list();
+            continue;
+        }
+        if (msg.message == WM_KEYDOWN && msg.wParam >= '0' && msg.wParam <= '2' && GetKeyState(VK_CONTROL) < 0) {
+            set_side_split(msg.wParam == '0' ? 500 : msg.wParam == '1' ? 1000 : 0);
+            continue;
+        }
         if (msg.message == WM_KEYDOWN && msg.wParam == 'F' && GetKeyState(VK_CONTROL) < 0) {
             find_show();
             continue;
