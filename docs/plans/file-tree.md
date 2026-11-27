@@ -40,7 +40,8 @@ expanded with the mouse or with Explorer-style keys, and single-child folder cha
     the badge and the name in `fg`. Indent = `depth * scale(14)`. Same visible-rows loop, same theme colors.
 - **Stage 2 collapse:** `app.shown` = an int array (from the status arena, one int per tree row) listing the indices
   of the visible tree rows. It's rebuilt in one O(n) walk only on toggle, collapse/expand and a new status, never in
-  paint. Collapsed folders skip `[i+1, end)`. In flat view `shown` is the identity. Collapsing a folder that holds
+  paint. Collapsed folders skip `[i+1, end)`. `app.sel` is a list position; `app.diff_sel` indexes the view's rows, so
+  the open file is tracked while its folder is collapsed. Clicking a folder row selects and toggles it. In flat view `shown` is the identity. Collapsing a folder that holds
   the selection moves the selection to that folder. On auto-refresh, collapsed state is copied over by (group, folder
   path).
 
@@ -65,7 +66,7 @@ expanded with the mouse or with Explorer-style keys, and single-child folder cha
   tree.
 - New files/structs: none (`app.shown` is an int array in the status arena).
 - Files touched: `src/main.c`, `src/git.c` (arena space for `shown`), `docs/history.md`.
-- [ ] done
+- [x] done
 
 ## Out of scope
 Remembering flat/tree or collapsed state between runs, a keyboard shortcut for the toggle, folder file counts or

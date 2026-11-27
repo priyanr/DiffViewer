@@ -98,7 +98,7 @@ static struct {
     StatusResult *status;  // NULL until the first list arrives
     int loading;
     int sel, top, wheel_rest;
-    int diff_sel;          // row whose diff is open: sel, or the last file while a folder is selected
+    int diff_sel;          // index into view_rows() of the open file (sel is a list position); -1 for none
     int tree;              // the file list shows tree_rows instead of rows
     int list_w96;          // file list width at 96 DPI, set by dragging the split
     int drag_dx;           // while dragging the split: mouse x minus list width; -1 otherwise
@@ -375,14 +375,45 @@ static int view_count(const StatusResult *s)
     return app.tree ? s->tree_count : s->row_count;
 }
 
+// Rows the list shows, by position.
 static int row_count(void)
 {
-    return app.status ? view_count(app.status) : 0;
+    return app.status ? app.status->shown_count : 0;
 }
 
-static ListRow *row_at(int row)
+static ListRow *row_at(int pos)
 {
-    return &view_rows(app.status)[row];
+    return &view_rows(app.status)[app.status->shown[pos]];
+}
+
+// Fills status->shown: every row in flat view; in tree view, the rows outside collapsed folders.
+static void list_build_shown(void)
+{
+    StatusResult *s = app.status;
+    const ListRow *rows = view_rows(s);
+    int n = 0;
+    for (int i = 0; i < view_count(s); i++) {
+        s->shown[n++] = i;
+        if (rows[i].folder && rows[i].collapsed)
+            i = rows[i].end - 1;
+    }
+    s->shown_count = n;
+}
+
+// List position of view row `row`, or of the collapsed folder hiding it: the last shown row at or
+// before it, as shown is ascending.
+static int list_position(int row)
+{
+    const int *shown = app.status->shown;
+    int lo = 0, hi = app.status->shown_count - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (shown[mid] <= row)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    return lo;
 }
 
 static void perf_print(const char *text)
@@ -1418,11 +1449,11 @@ static void list_select(int row, int dir, int files_only)
     if (r == app.sel)
         return;
     app.sel = r;
-    if (row_at(r)->folder || r == app.diff_sel)
+    if (row_at(r)->folder || app.status->shown[r] == app.diff_sel)
         return;
     if (app.diff_sel >= 0)
         app.language_pick = LANG_AUTO;  // a pick is for one file; -1 is a refresh of the same file
-    app.diff_sel = r;
+    app.diff_sel = app.status->shown[r];
     // Holding a key down queues many requests; the worker only runs the latest one.
     git_request_diff(app.status, row_at(r), ++app.diff_generation, app.language_pick, app.ignore_eol);
 }
@@ -1461,7 +1492,7 @@ static void list_paint(HWND hwnd)
         wchar_t text[1024];
         if (list_row->folder) {
             int n = utf8_to_wide(f->path + list_row->name_start, list_row->name_len, text + 2, 1022);
-            text[0] = 0x25BE;  // down-pointing small triangle: expanded
+            text[0] = list_row->collapsed ? 0x25B8 : 0x25BE;  // small triangle pointing right / down
             text[1] = ' ';
             SelectObject(dc, app.ui_font);
             SetTextColor(dc, t->dim);
@@ -1512,6 +1543,45 @@ static void list_paint(HWND hwnd)
         app.startup_ms = ms_since_process_start();
 }
 
+// Tree view: collapses or expands the folder at list position `pos`. A selection inside it moves
+// to the folder; the open diff stays.
+static void list_set_collapsed(int pos, int collapsed)
+{
+    ListRow *row = row_at(pos);
+    if (!row->folder || row->collapsed == collapsed)
+        return;
+    int sel_row = app.status->shown[app.sel];
+    row->collapsed = (unsigned char)collapsed;
+    list_build_shown();
+    app.sel = list_position(sel_row);
+    list_scroll_to(app.top);
+    list_select(app.sel, 1, 0);  // keeps the selection in view
+}
+
+// Tree view: Left collapses the selected folder, or goes to the parent folder; Right expands it,
+// or goes to its first row.
+static void list_left_right(int dir)
+{
+    if (app.sel < 0)
+        return;
+    const ListRow *row = row_at(app.sel);
+    if (row->folder && row->collapsed == (dir > 0)) {
+        list_set_collapsed(app.sel, dir < 0);
+        return;
+    }
+    if (dir > 0) {
+        if (row->folder)
+            list_select(app.sel + 1, 1, 0);
+        return;
+    }
+    for (int i = app.sel - 1; i >= 0 && !is_header(i); i--) {
+        if (row_at(i)->depth < row->depth) {
+            list_select(i, -1, 0);
+            return;
+        }
+    }
+}
+
 static LRESULT CALLBACK list_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -1538,8 +1608,11 @@ static LRESULT CALLBACK list_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN: {
         SetFocus(hwnd);
         int row = app.top + (short)HIWORD(lp) / app.row_h;
-        if (row < row_count())
-            list_select(row, 1, 0);
+        if (row >= row_count())
+            return 0;
+        list_select(row, 1, 0);
+        if (app.sel == row && row_at(row)->folder)
+            list_set_collapsed(row, !row_at(row)->collapsed);
         return 0;
     }
     case WM_KEYDOWN: {
@@ -1551,6 +1624,12 @@ static LRESULT CALLBACK list_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case VK_NEXT: list_select(app.sel + visible, 1, 0); break;
         case VK_HOME: list_select(0, 1, 0); break;
         case VK_END: list_select(row_count() - 1, -1, 0); break;
+        case VK_LEFT: list_left_right(-1); break;
+        case VK_RIGHT: list_left_right(1); break;
+        case VK_RETURN:
+            if (app.sel >= 0)
+                list_set_collapsed(app.sel, !row_at(app.sel)->collapsed);
+            break;
         case VK_TAB: move_focus(hwnd, GetKeyState(VK_SHIFT) < 0); break;
         case 'U': toggle_view(); break;
         case 'N': goto_change(1); break;
@@ -2000,28 +2079,33 @@ static void paint_pair(HDC dc, const RECT *box, const wchar_t *left, const wchar
 static void reload_diff(void)
 {
     app.keep_scroll_generation = app.diff_generation + 1;
-    git_request_diff(app.status, row_at(app.diff_sel), ++app.diff_generation, app.language_pick, app.ignore_eol);
+    git_request_diff(app.status, &view_rows(app.status)[app.diff_sel], ++app.diff_generation, app.language_pick,
+                     app.ignore_eol);
 }
 
-// [Flat | Tree]: the open file stays selected in the other view, also when a folder was selected.
+// [Flat | Tree]: the open file stays selected in the other view, also when a folder was selected;
+// in a collapsed folder, the folder is selected.
 static void toggle_tree(void)
 {
     int type = 0, file = -1;
-    if (app.diff_sel >= 0) {
-        type = row_at(app.diff_sel)->type;
-        file = row_at(app.diff_sel)->file;
+    if (app.status && app.diff_sel >= 0) {
+        type = view_rows(app.status)[app.diff_sel].type;
+        file = view_rows(app.status)[app.diff_sel].file;
     }
     app.tree = !app.tree;
+    InvalidateRect(app.main, NULL, FALSE);
+    if (!app.status)
+        return;  // still loading: on_status builds the list
+    list_build_shown();
     app.sel = app.diff_sel = -1;
-    for (int i = 0; file >= 0 && i < row_count() && app.diff_sel < 0; i++) {
-        const ListRow *row = row_at(i);
-        if (!row->folder && row->type == type && row->file == file)
+    const ListRow *rows = view_rows(app.status);
+    for (int i = 0; file >= 0 && i < view_count(app.status) && app.diff_sel < 0; i++) {
+        if (!rows[i].folder && rows[i].type == type && rows[i].file == file)
             app.diff_sel = i;
     }
     list_scroll_to(app.top);
     if (app.diff_sel >= 0)
-        list_select(app.diff_sel, 1, 1);
-    InvalidateRect(app.main, NULL, FALSE);
+        list_select(list_position(app.diff_sel), 1, 0);
 }
 
 // Button and F11: hides the file list so the diff takes the full width, or brings it back.
@@ -2172,14 +2256,15 @@ static void clear_diff(void)
     diff_scroll_to(0, 0);
 }
 
-// Index of the row of `r` showing the same file or folder, in the same group, as `row` of the
-// previous list `old`; -1 when it is gone.
-static int find_row(const StatusResult *r, const StatusResult *old, const ListRow *row)
+// Index into `rows` (of `r`) of the row showing the same file or folder, in the same group, as
+// `row` of the previous list `old`; -1 when it is gone.
+static int find_row(const StatusResult *r, const ListRow *rows, int count, const StatusResult *old,
+                    const ListRow *row)
 {
     const char *path = old->files[row->file].path;
     int len = row->folder ? row->name_start + row->name_len : lstrlenA(path);
-    for (int i = 0; i < view_count(r); i++) {
-        const ListRow *x = &view_rows(r)[i];
+    for (int i = 0; i < count; i++) {
+        const ListRow *x = &rows[i];
         if (x->type != row->type || x->folder != row->folder)
             continue;
         const char *p = r->files[x->file].path;
@@ -2197,22 +2282,29 @@ static int find_row(const StatusResult *r, const StatusResult *old, const ListRo
 static void on_status(StatusResult *r)
 {
     // After an auto-refresh, select the same file or folder in the same group if it is still
-    // there, and keep the open file.
-    int sel = 0, sel_found = 0, diff_sel = -1, keep_top = 0;
+    // there, and keep the open file. `sel` and `diff_sel` index view_rows(r) until the list is built.
+    int sel = -1, diff_sel = -1, fallback = 0, keep_top = 0;
     if (r->auto_refresh && app.status && app.sel >= 0) {
-        int found = find_row(r, app.status, row_at(app.sel));
+        sel = find_row(r, view_rows(r), view_count(r), app.status, row_at(app.sel));
         if (app.diff_sel >= 0)
-            diff_sel = find_row(r, app.status, row_at(app.diff_sel));
-        if (found < 0)
-            found = diff_sel;  // the selected folder is gone, e.g. a compact chain split up: select the open file
-        sel_found = found >= 0;
-        sel = sel_found ? found : app.sel < view_count(r) ? app.sel : view_count(r) - 1;
+            diff_sel = find_row(r, view_rows(r), view_count(r), app.status, &view_rows(app.status)[app.diff_sel]);
+        if (sel < 0)
+            sel = diff_sel;  // the selected folder is gone, e.g. a compact chain merged: select the open file
+        fallback = app.sel;
         keep_top = app.top;
     }
-    int same_file = diff_sel >= 0;
+    // Collapsed folders stay collapsed, also those of the tree view while the flat one is shown.
+    for (int i = 0; app.status && i < app.status->tree_count; i++) {
+        const ListRow *folder = &app.status->tree_rows[i];
+        int k = folder->collapsed ? find_row(r, r->tree_rows, r->tree_count, app.status, folder) : -1;
+        if (k >= 0)
+            r->tree_rows[k].collapsed = 1;
+    }
+    int sel_found = sel >= 0, same_file = diff_sel >= 0;
     if (app.status)
         status_free(app.status);
     app.status = r;
+    list_build_shown();
     app.loading = 0;
     app.sel = app.diff_sel = -1;
     if (!same_file)
@@ -2228,17 +2320,21 @@ static void on_status(StatusResult *r)
         return;
     }
     if (same_file && app.diff && app.diff->generation == app.diff_generation &&
-        diff_is_current(app.diff, r, row_at(diff_sel)))
+        diff_is_current(app.diff, r, &view_rows(r)[diff_sel]))
         app.diff_sel = diff_sel;  // the file did not change: list_select keeps the open diff
     else if (same_file)
         app.keep_scroll_generation = app.diff_generation + 1;  // the request list_select makes below
     if (!r->auto_refresh)
         clear_diff();
+    sel = sel_found ? list_position(sel) : fallback < r->shown_count ? fallback : r->shown_count - 1;
     if (sel_found && row_at(sel)->folder) {
-        if (same_file)
-            list_select(diff_sel, 1, 1);  // reloads the open file if it changed
-        else
-            clear_diff();  // the open file is gone
+        // A folder is selected (or hides the selected file): the open file stays, reloaded if it changed.
+        if (!same_file) {
+            clear_diff();
+        } else if (app.diff_sel < 0) {
+            app.diff_sel = diff_sel;
+            reload_diff();
+        }
     }
     list_select(sel, 1, !sel_found);
 }

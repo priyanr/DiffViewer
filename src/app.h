@@ -33,6 +33,7 @@ typedef struct {
     unsigned char type;
     unsigned char folder;  // tree: a folder row; `file` is a file under it, whose path holds the name
     unsigned char depth;   // tree: nesting level, 0 at the top
+    unsigned char collapsed;  // folder: its rows are hidden; set by the UI
     int file;
     unsigned short name_start, name_len;  // folder: its name in files[file].path, "a/b" for a compact chain
     int end;               // folder: index of the first row after its subtree
@@ -50,6 +51,8 @@ typedef struct {
     int row_count;
     ListRow *tree_rows;     // tree view: the same groups, folders first, then files
     int tree_count;
+    int *shown;             // filled by the UI: index into rows or tree_rows of each row the list shows
+    int shown_count;
     wchar_t error[512];     // set when the file list could not be read
     DWORD elapsed_ms;
 } StatusResult;

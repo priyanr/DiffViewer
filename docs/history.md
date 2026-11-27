@@ -1,5 +1,16 @@
 # History
 
+## 2026-11-27: file tree view, stage 2: collapse / expand (plan: `docs/plans/file-tree.md`)
+
+Existing features affected:
+- **File list mouse, tree view only:** clicking a folder row selects it and collapses or expands it (▾ / ▸).
+- **List keys, tree view only:** Enter toggles the selected folder; Left collapses it or goes to the parent folder;
+  Right expands it or goes to its first row. Unused before; they do nothing in flat view.
+- **Selection:** collapsing a folder that holds the selection selects the folder; the open diff stays. Prev/Next and
+  Up/Down pass over the files of collapsed folders.
+- **Auto-refresh / Flat ↔ Tree:** collapsed folders stay collapsed; when the open file is in one, the folder is
+  selected.
+
 ## 2026-11-27: file tree view, stage 1 (plan: `docs/plans/file-tree.md`)
 
 Existing features affected:

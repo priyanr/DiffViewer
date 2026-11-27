@@ -287,6 +287,7 @@ static void build_tree(Arena *arena, StatusResult *r)
         }
         tree_add(arena, r, type, order, n, 0, 0);
     }
+    r->shown = arena_push(arena, r->tree_count * sizeof(int));  // tree_rows has all of rows plus folders
 }
 
 static void watch_issue(void)
