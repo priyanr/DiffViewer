@@ -1,5 +1,27 @@
 # History
 
+## 2026-11-27: file tree view, stage 2: collapse / expand (plan: `docs/plans/file-tree.md`)
+
+Existing features affected:
+- **File list mouse, tree view only:** clicking a folder row selects it and collapses or expands it (▾ / ▸).
+- **List keys, tree view only:** Enter toggles the selected folder; Left collapses it or goes to the parent folder;
+  Right expands it or goes to its first row. Unused before; they do nothing in flat view.
+- **Selection:** collapsing a folder that holds the selection selects the folder; the open diff stays. Prev/Next and
+  Up/Down pass over the files of collapsed folders.
+- **Auto-refresh / Flat ↔ Tree:** collapsed folders stay collapsed; when the open file is in one, the folder is
+  selected.
+
+## 2026-11-27: file tree view, stage 1 (plan: `docs/plans/file-tree.md`)
+
+Existing features affected:
+- **Top bar:** a `[Flat | Tree]` switch right after the « button; the path box is 110 px (96 DPI) narrower. Flat is
+  the default and the choice lasts for the session.
+- **File list, tree view only:** folders (single-child chains as one row, e.g. `src/app/models`) come first, then
+  files, under the STAGED / UNSTAGED headers; ref compare is one tree. File rows show the badge and name only.
+- **List keys / mouse, tree view only:** Up/Down/PgUp/PgDn/Home/End and clicks also select folder rows; a selected
+  folder opens no diff and the last file stays open. Prev/Next (N/P/F7) to another file skips folders.
+- **Auto-refresh:** keeps a selected folder too, along with the open file.
+
 ## 2026-11-18: resizable side-by-side halves, stage 2 of full-fit (plan: `docs/plans/full-fit.md`)
 
 Existing features affected:

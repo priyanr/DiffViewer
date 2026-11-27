@@ -27,11 +27,16 @@ typedef struct {
 
 enum { ROW_STAGED_HEADER, ROW_UNSTAGED_HEADER, ROW_STAGED, ROW_UNSTAGED, ROW_REF };
 
-// One row of the file list: a group header or a file shown in one group. A file with staged and
-// unstaged changes has a row in each group.
+// One row of the file list: a group header, a file shown in one group, or (tree view) a folder of
+// a group. A file with staged and unstaged changes has a row in each group.
 typedef struct {
-    int type;
+    unsigned char type;
+    unsigned char folder;  // tree: a folder row; `file` is a file under it, whose path holds the name
+    unsigned char depth;   // tree: nesting level, 0 at the top
+    unsigned char collapsed;  // folder: its rows are hidden; set by the UI
     int file;
+    unsigned short name_start, name_len;  // folder: its name in files[file].path, "a/b" for a compact chain
+    int end;               // folder: index of the first row after its subtree
 } ListRow;
 
 typedef struct {
@@ -42,8 +47,12 @@ typedef struct {
     int auto_refresh;       // 1 when started by a change in the folder, not by the user
     FileEntry *files;
     int file_count;
-    ListRow *rows;
+    ListRow *rows;          // flat view
     int row_count;
+    ListRow *tree_rows;     // tree view: the same groups, folders first, then files
+    int tree_count;
+    int *shown;             // filled by the UI: index into rows or tree_rows of each row the list shows
+    int shown_count;
     wchar_t error[512];     // set when the file list could not be read
     DWORD elapsed_ms;
 } StatusResult;
