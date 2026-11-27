@@ -2293,8 +2293,9 @@ static void on_status(StatusResult *r)
         fallback = app.sel;
         keep_top = app.top;
     }
-    // Collapsed folders stay collapsed, also those of the tree view while the flat one is shown.
-    for (int i = 0; app.status && i < app.status->tree_count; i++) {
+    // After an auto-refresh, collapsed folders stay collapsed, also those of the tree view while
+    // the flat one is shown.
+    for (int i = 0; r->auto_refresh && app.status && i < app.status->tree_count; i++) {
         const ListRow *folder = &app.status->tree_rows[i];
         int k = folder->collapsed ? find_row(r, r->tree_rows, r->tree_count, app.status, folder) : -1;
         if (k >= 0)
