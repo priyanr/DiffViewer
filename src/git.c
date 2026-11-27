@@ -178,12 +178,115 @@ static const char *next_token(const char **p)
     return token;
 }
 
-static void add_row(Arena *arena, StatusResult *r, int type, int file)
+static ListRow *add_row(Arena *arena, int *count, int type, int file)
 {
     ListRow *row = arena_push(arena, sizeof *row);
-    row->type = type;
-    row->file = file;
-    r->row_count++;
+    *row = (ListRow){.type = (unsigned char)type, .file = file};
+    (*count)++;
+    return row;
+}
+
+static int path_cmp(const char *a, const char *b)
+{
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+// Whether `path` is in the folder made of the first `len` bytes of `folder`.
+static int in_folder(const char *path, const char *folder, int len)
+{
+    for (int i = 0; i < len; i++) {
+        if (path[i] != folder[i])
+            return 0;
+    }
+    return path[len] == '/';
+}
+
+static const char *find_slash(const char *s)
+{
+    while (*s && *s != '/')
+        s++;
+    return *s ? s : NULL;
+}
+
+// Adds the tree rows of files order[0..n), whose paths all start with the same `prefix` bytes:
+// its folders first, then the files directly in it. In byte order a folder's files are adjacent.
+static void tree_add(Arena *arena, StatusResult *r, int type, const int *order, int n, int prefix, int depth)
+{
+    for (int i = 0; i < n;) {
+        const char *path = r->files[order[i]].path;
+        const char *slash = find_slash(path + prefix);
+        if (!slash) {
+            i++;
+            continue;
+        }
+        int name_end = (int)(slash - path);
+        int j = i + 1;
+        while (j < n && in_folder(r->files[order[j]].path, path, name_end))
+            j++;
+        // A folder holding just one folder (and no files) is shown as one row: "a/b".
+        for (const char *next; (next = find_slash(path + name_end + 1));) {
+            int k = i;
+            while (k < j && in_folder(r->files[order[k]].path, path, (int)(next - path)))
+                k++;
+            if (k < j)
+                break;
+            name_end = (int)(next - path);
+        }
+        ListRow *row = add_row(arena, &r->tree_count, type, order[i]);
+        row->folder = 1;
+        row->depth = (unsigned char)depth;
+        row->name_start = (unsigned short)prefix;
+        row->name_len = (unsigned short)(name_end - prefix);
+        tree_add(arena, r, type, order + i, j - i, name_end + 1, depth + 1);
+        row->end = r->tree_count;
+        i = j;
+    }
+    for (int i = 0; i < n; i++) {
+        if (!find_slash(r->files[order[i]].path + prefix))
+            add_row(arena, &r->tree_count, type, order[i])->depth = (unsigned char)depth;
+    }
+}
+
+// The tree view of r->rows: the same group headers, each group's files sorted by path and nested
+// under folder rows.
+static void build_tree(Arena *arena, StatusResult *r)
+{
+    int *order = arena_push(arena, r->row_count * sizeof(int));
+    int *scratch = arena_push(arena, r->row_count * sizeof(int));
+    r->tree_rows = arena_push(arena, 0);
+    for (int i = 0; i < r->row_count;) {
+        int type = r->rows[i].type;
+        if (type == ROW_STAGED_HEADER || type == ROW_UNSTAGED_HEADER) {
+            add_row(arena, &r->tree_count, type, -1);
+            i++;
+            continue;
+        }
+        int n = 0;
+        for (; i < r->row_count && r->rows[i].type == type; i++)
+            order[n++] = r->rows[i].file;
+
+        // Bottom-up merge sort by path: git lists untracked files after the tracked ones, and
+        // there is no C runtime qsort.
+        for (int width = 1; width < n; width *= 2) {
+            for (int lo = 0; lo < n; lo += 2 * width) {
+                int mid = lo + width < n ? lo + width : n, hi = lo + 2 * width < n ? lo + 2 * width : n;
+                int a = lo, b = mid, k = lo;
+                while (a < mid && b < hi)
+                    scratch[k++] = path_cmp(r->files[order[b]].path, r->files[order[a]].path) < 0 ? order[b++]
+                                                                                                    : order[a++];
+                while (a < mid)
+                    scratch[k++] = order[a++];
+                while (b < hi)
+                    scratch[k++] = order[b++];
+            }
+            memcpy(order, scratch, n * sizeof(int));
+        }
+        tree_add(arena, r, type, order, n, 0, 0);
+    }
 }
 
 static void watch_issue(void)
@@ -295,20 +398,21 @@ static void load_working_tree(Arena *arena, StatusResult *r, const char *out, si
     }
     r->rows = arena_push(arena, 0);
     if (staged) {
-        add_row(arena, r, ROW_STAGED_HEADER, -1);
+        add_row(arena, &r->row_count, ROW_STAGED_HEADER, -1);
         for (int i = 0; i < r->file_count; i++) {
             const FileEntry *f = &r->files[i];
             if (f->kind != '?' && f->kind != 'u' && f->x != '.')
-                add_row(arena, r, ROW_STAGED, i);
+                add_row(arena, &r->row_count, ROW_STAGED, i);
         }
         if (unstaged)
-            add_row(arena, r, ROW_UNSTAGED_HEADER, -1);
+            add_row(arena, &r->row_count, ROW_UNSTAGED_HEADER, -1);
     }
     for (int i = 0; i < r->file_count; i++) {
         const FileEntry *f = &r->files[i];
         if (f->kind == '?' || f->kind == 'u' || f->y != '.')
-            add_row(arena, r, ROW_UNSTAGED, i);
+            add_row(arena, &r->row_count, ROW_UNSTAGED, i);
     }
+    build_tree(arena, r);
 }
 
 static void load_ref_compare(Arena *arena, StatusResult *r, const char *out, size_t len)
@@ -329,7 +433,8 @@ static void load_ref_compare(Arena *arena, StatusResult *r, const char *out, siz
     }
     r->rows = arena_push(arena, 0);
     for (int i = 0; i < r->file_count; i++)
-        add_row(arena, r, ROW_REF, i);
+        add_row(arena, &r->row_count, ROW_REF, i);
+    build_tree(arena, r);
 }
 
 static StatusResult *load_status(const StatusRequest *req, int auto_refresh)

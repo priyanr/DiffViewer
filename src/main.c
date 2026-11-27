@@ -62,6 +62,7 @@ static const Theme light_theme = {
 // Layout sizes at 96 DPI.
 enum { PAD = 8, BAR_H = 40, LIST_W = 340, STATUS_H = 24, REF_W = 150, ARROW_W = 24, TOGGLE_W = 180, NAV_W = 150 };
 enum { SPLIT_W = 5, MIN_LIST_W = 120, MIN_DIFF_W = 200 };  // draggable strip between list and diff
+enum { TREE_W = 110, TREE_INDENT = 14 };  // [Flat | Tree] width; tree view indent per folder level
 enum { MIN_SIDE_W = 60 };  // side by side: a half dragged narrower than this collapses
 enum { CHANGE_CONTEXT = 3 };  // rows left above a change that Prev/Next moves to
 enum { EDIT_PATH, EDIT_BASE, EDIT_TARGET, EDIT_FIND, EDIT_COUNT };
@@ -86,6 +87,7 @@ static struct {
     RECT language_field;   // status bar, right end: opens the highlighter menu
     RECT eol_field;        // status bar, left of language_field: the "Ignore line endings" checkbox
     RECT list_button;      // top bar, far left: hides / shows the file list
+    RECT tree_toggle;      // top bar, right of list_button: [Flat | Tree]
     UINT dpi;
     const Theme *theme;
     HFONT ui_font, bold_font, code_font;
@@ -96,6 +98,8 @@ static struct {
     StatusResult *status;  // NULL until the first list arrives
     int loading;
     int sel, top, wheel_rest;
+    int diff_sel;          // row whose diff is open: sel, or the last file while a folder is selected
+    int tree;              // the file list shows tree_rows instead of rows
     int list_w96;          // file list width at 96 DPI, set by dragging the split
     int drag_dx;           // while dragging the split: mouse x minus list width; -1 otherwise
     int list_hidden;       // the file list is hidden and the diff takes the full width
@@ -313,8 +317,9 @@ static void layout(void)
     GetClientRect(app.main, &c);
     int bar = scale(BAR_H), status = scale(STATUS_H), pad = scale(PAD);
 
-    // Top bar: [<<] [path ........] [base] -> [target] [Prev | Next] [Unified | Side by side]
+    // Top bar: [<<] [Flat | Tree] [path ........] [base] -> [target] [Prev | Next] [Unified | Side by side]
     app.list_button = (RECT){pad, pad, bar - pad, bar - pad};
+    app.tree_toggle = (RECT){app.list_button.right + pad, pad, app.list_button.right + pad + scale(TREE_W), bar - pad};
     int right = c.right - pad;
     app.toggle = (RECT){right - scale(TOGGLE_W), pad, right, bar - pad};
     right = app.toggle.left - pad;
@@ -324,7 +329,7 @@ static void layout(void)
     right = app.frames[EDIT_TARGET].left - scale(ARROW_W);
     app.frames[EDIT_BASE] = (RECT){right - scale(REF_W), pad, right, bar - pad};
     right = app.frames[EDIT_BASE].left - pad;
-    int path_left = app.list_button.right + pad;
+    int path_left = app.tree_toggle.right + pad;
     app.frames[EDIT_PATH] = (RECT){path_left, pad, right > path_left ? right : path_left, bar - pad};
 
     int list_w = list_width(), split = app.list_hidden ? 0 : scale(SPLIT_W);
@@ -360,9 +365,24 @@ static void layout(void)
                TRUE);
 }
 
+static ListRow *view_rows(const StatusResult *s)
+{
+    return app.tree ? s->tree_rows : s->rows;
+}
+
+static int view_count(const StatusResult *s)
+{
+    return app.tree ? s->tree_count : s->row_count;
+}
+
 static int row_count(void)
 {
-    return app.status ? app.status->row_count : 0;
+    return app.status ? view_count(app.status) : 0;
+}
+
+static ListRow *row_at(int row)
+{
+    return &view_rows(app.status)[row];
 }
 
 static void perf_print(const char *text)
@@ -1120,7 +1140,7 @@ static void show_change(int row)
     diff_scroll_to(row - CHANGE_CONTEXT, app.diff_left);
 }
 
-static void list_select(int row, int dir);
+static void list_select(int row, int dir, int files_only);
 
 // Prev/Next: the previous/next change in this file, then the previous/next file's last/first change.
 static void goto_change(int dir)
@@ -1138,12 +1158,11 @@ static void goto_change(int dir)
     }
     if (!app.status || app.sel < 0)
         return;
-    int old_sel = app.sel;
     app.change_generation = app.diff_generation + 1;  // the request list_select makes
     app.change_dir = dir;
-    list_select(app.sel + dir, dir);
-    if (app.sel == old_sel)
-        app.change_generation = 0;  // already at the first/last file
+    list_select(app.sel + dir, dir, 1);
+    if (app.change_generation != app.diff_generation)
+        app.change_generation = 0;  // no request: already at the first/last file, or back on the open one
 }
 
 // Side by side: whether pane x is on the divider between the halves (a few pixels either side of the line).
@@ -1310,8 +1329,14 @@ static LRESULT CALLBACK diff_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static int is_header(int row)
 {
-    int type = app.status->rows[row].type;
+    int type = row_at(row)->type;
     return type == ROW_STAGED_HEADER || type == ROW_UNSTAGED_HEADER;
+}
+
+// Rows the selection passes over: group headers, and folders when only a file will do.
+static int is_skipped(int row, int files_only)
+{
+    return is_header(row) || (files_only && row_at(row)->folder);
 }
 
 static char row_badge(const ListRow *row)
@@ -1365,18 +1390,19 @@ static void list_scroll_to(int top)
     InvalidateRect(app.list, NULL, FALSE);
 }
 
-// Selects `row`, or the nearest file row in direction `dir` (+1/-1) when it is a group header.
-static void list_select(int row, int dir)
+// Selects `row`, or the nearest row in direction `dir` (+1/-1) when it is a group header, or a
+// folder and `files_only` is set. A selected folder requests no diff: the last file stays open.
+static void list_select(int row, int dir, int files_only)
 {
     int count = row_count();
     if (count == 0)
         return;
     row = row < 0 ? 0 : row >= count ? count - 1 : row;
     int r = row;
-    while (r >= 0 && r < count && is_header(r))
+    while (r >= 0 && r < count && is_skipped(r, files_only))
         r += dir;
     if (r < 0 || r >= count) {
-        for (r = row; r >= 0 && r < count && is_header(r); r -= dir) {
+        for (r = row; r >= 0 && r < count && is_skipped(r, files_only); r -= dir) {
         }
     }
     if (r < 0 || r >= count)
@@ -1391,11 +1417,14 @@ static void list_select(int row, int dir)
     InvalidateRect(app.list, NULL, FALSE);
     if (r == app.sel)
         return;
-    if (app.sel >= 0)
-        app.language_pick = LANG_AUTO;  // a pick is for one file; -1 is a refresh of the same file
     app.sel = r;
+    if (row_at(r)->folder || r == app.diff_sel)
+        return;
+    if (app.diff_sel >= 0)
+        app.language_pick = LANG_AUTO;  // a pick is for one file; -1 is a refresh of the same file
+    app.diff_sel = r;
     // Holding a key down queues many requests; the worker only runs the latest one.
-    git_request_diff(app.status, &app.status->rows[r], ++app.diff_generation, app.language_pick, app.ignore_eol);
+    git_request_diff(app.status, row_at(r), ++app.diff_generation, app.language_pick, app.ignore_eol);
 }
 
 static void list_paint(HWND hwnd)
@@ -1418,7 +1447,7 @@ static void list_paint(HWND hwnd)
             fill(dc, &r, t->panel);
             continue;
         }
-        const ListRow *list_row = &app.status->rows[row];
+        const ListRow *list_row = row_at(row);
         fill(dc, &r, row == app.sel ? t->sel : t->panel);
         if (is_header(row)) {
             const wchar_t *label = list_row->type == ROW_STAGED_HEADER ? L"STAGED" : L"UNSTAGED";
@@ -1428,12 +1457,23 @@ static void list_paint(HWND hwnd)
             continue;
         }
         const FileEntry *f = &app.status->files[list_row->file];
+        int indent = list_row->depth * scale(TREE_INDENT);
+        wchar_t text[1024];
+        if (list_row->folder) {
+            int n = utf8_to_wide(f->path + list_row->name_start, list_row->name_len, text + 2, 1022);
+            text[0] = 0x25BE;  // down-pointing small triangle: expanded
+            text[1] = ' ';
+            SelectObject(dc, app.ui_font);
+            SetTextColor(dc, t->dim);
+            ExtTextOutW(dc, scale(10) + indent, y, ETO_CLIPPED, &r, text, (UINT)n + 2, NULL);
+            continue;
+        }
 
         char b = row_badge(list_row);
         wchar_t badge_text = (wchar_t)b;
         SelectObject(dc, app.bold_font);
         SetTextColor(dc, badge_color(b));
-        ExtTextOutW(dc, scale(10), y, ETO_CLIPPED, &r, &badge_text, 1, NULL);
+        ExtTextOutW(dc, scale(10) + indent, y, ETO_CLIPPED, &r, &badge_text, 1, NULL);
 
         // File name first, then its folder dimmed, so the name is visible however deep it is.
         const char *slash = NULL;
@@ -1442,13 +1482,12 @@ static void list_paint(HWND hwnd)
                 slash = p;
         }
         const char *name = slash ? slash + 1 : f->path;
-        wchar_t text[1024];
         int n = utf8_to_wide(name, lstrlenA(name), text, 1024);
-        int x = scale(30);
+        int x = scale(30) + indent;
         SelectObject(dc, app.ui_font);
         SetTextColor(dc, t->fg);
         ExtTextOutW(dc, x, y, ETO_CLIPPED, &r, text, (UINT)n, NULL);
-        if (slash) {
+        if (slash && !app.tree) {  // the tree already shows the folder
             SIZE size;
             GetTextExtentPoint32W(dc, text, n, &size);
             x += size.cx + scale(8);
@@ -1500,18 +1539,18 @@ static LRESULT CALLBACK list_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SetFocus(hwnd);
         int row = app.top + (short)HIWORD(lp) / app.row_h;
         if (row < row_count())
-            list_select(row, 1);
+            list_select(row, 1, 0);
         return 0;
     }
     case WM_KEYDOWN: {
         int visible = list_visible_rows();
         switch (wp) {
-        case VK_UP: list_select(app.sel - 1, -1); break;
-        case VK_DOWN: list_select(app.sel + 1, 1); break;
-        case VK_PRIOR: list_select(app.sel - visible, -1); break;
-        case VK_NEXT: list_select(app.sel + visible, 1); break;
-        case VK_HOME: list_select(0, 1); break;
-        case VK_END: list_select(row_count() - 1, -1); break;
+        case VK_UP: list_select(app.sel - 1, -1, 0); break;
+        case VK_DOWN: list_select(app.sel + 1, 1, 0); break;
+        case VK_PRIOR: list_select(app.sel - visible, -1, 0); break;
+        case VK_NEXT: list_select(app.sel + visible, 1, 0); break;
+        case VK_HOME: list_select(0, 1, 0); break;
+        case VK_END: list_select(row_count() - 1, -1, 0); break;
         case VK_TAB: move_focus(hwnd, GetKeyState(VK_SHIFT) < 0); break;
         case 'U': toggle_view(); break;
         case 'N': goto_change(1); break;
@@ -1961,7 +2000,28 @@ static void paint_pair(HDC dc, const RECT *box, const wchar_t *left, const wchar
 static void reload_diff(void)
 {
     app.keep_scroll_generation = app.diff_generation + 1;
-    git_request_diff(app.status, &app.status->rows[app.sel], ++app.diff_generation, app.language_pick, app.ignore_eol);
+    git_request_diff(app.status, row_at(app.diff_sel), ++app.diff_generation, app.language_pick, app.ignore_eol);
+}
+
+// [Flat | Tree]: the open file stays selected in the other view, also when a folder was selected.
+static void toggle_tree(void)
+{
+    int type = 0, file = -1;
+    if (app.diff_sel >= 0) {
+        type = row_at(app.diff_sel)->type;
+        file = row_at(app.diff_sel)->file;
+    }
+    app.tree = !app.tree;
+    app.sel = app.diff_sel = -1;
+    for (int i = 0; file >= 0 && i < row_count() && app.diff_sel < 0; i++) {
+        const ListRow *row = row_at(i);
+        if (!row->folder && row->type == type && row->file == file)
+            app.diff_sel = i;
+    }
+    list_scroll_to(app.top);
+    if (app.diff_sel >= 0)
+        list_select(app.diff_sel, 1, 1);
+    InvalidateRect(app.main, NULL, FALSE);
 }
 
 // Button and F11: hides the file list so the diff takes the full width, or brings it back.
@@ -2025,6 +2085,7 @@ static void main_paint(HWND hwnd)
     FrameRect(dc, &app.list_button, app.border_brush);
     SetTextColor(dc, t->fg);
     DrawTextW(dc, app.list_hidden ? L"\x00BB" : L"\x00AB", 1, &app.list_button, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    paint_pair(dc, &app.tree_toggle, L"Flat", L"Tree", app.tree);
     paint_pair(dc, &app.nav, L"\x25B2  Prev", L"\x25BC  Next", -1);
     paint_pair(dc, &app.toggle, L"Unified", L"Side by side", app.side_by_side);
     if (app.find_open) {
@@ -2111,28 +2172,49 @@ static void clear_diff(void)
     diff_scroll_to(0, 0);
 }
 
+// Index of the row of `r` showing the same file or folder, in the same group, as `row` of the
+// previous list `old`; -1 when it is gone.
+static int find_row(const StatusResult *r, const StatusResult *old, const ListRow *row)
+{
+    const char *path = old->files[row->file].path;
+    int len = row->folder ? row->name_start + row->name_len : lstrlenA(path);
+    for (int i = 0; i < view_count(r); i++) {
+        const ListRow *x = &view_rows(r)[i];
+        if (x->type != row->type || x->folder != row->folder)
+            continue;
+        const char *p = r->files[x->file].path;
+        if ((x->folder ? x->name_start + x->name_len : lstrlenA(p)) != len)
+            continue;
+        int k = 0;
+        while (k < len && p[k] == path[k])
+            k++;
+        if (k == len)
+            return i;
+    }
+    return -1;
+}
+
 static void on_status(StatusResult *r)
 {
-    // After an auto-refresh, select the same file in the same group if it is still there.
-    int sel = 0, keep_top = 0, same_file = 0;
+    // After an auto-refresh, select the same file or folder in the same group if it is still
+    // there, and keep the open file.
+    int sel = 0, sel_found = 0, diff_sel = -1, keep_top = 0;
     if (r->auto_refresh && app.status && app.sel >= 0) {
-        const ListRow *old = &app.status->rows[app.sel];
-        const char *old_path = app.status->files[old->file].path;
-        sel = app.sel < r->row_count ? app.sel : r->row_count - 1;
-        for (int i = 0; i < r->row_count && !same_file; i++) {
-            const ListRow *row = &r->rows[i];
-            if (row->type == old->type && lstrcmpA(r->files[row->file].path, old_path) == 0) {
-                sel = i;
-                same_file = 1;
-            }
-        }
+        int found = find_row(r, app.status, row_at(app.sel));
+        if (app.diff_sel >= 0)
+            diff_sel = find_row(r, app.status, row_at(app.diff_sel));
+        if (found < 0)
+            found = diff_sel;  // the selected folder is gone, e.g. a compact chain split up: select the open file
+        sel_found = found >= 0;
+        sel = sel_found ? found : app.sel < view_count(r) ? app.sel : view_count(r) - 1;
         keep_top = app.top;
     }
+    int same_file = diff_sel >= 0;
     if (app.status)
         status_free(app.status);
     app.status = r;
     app.loading = 0;
-    app.sel = -1;
+    app.sel = app.diff_sel = -1;
     if (!same_file)
         app.language_pick = LANG_AUTO;
     if (!r->auto_refresh && !r->error[0])
@@ -2146,13 +2228,19 @@ static void on_status(StatusResult *r)
         return;
     }
     if (same_file && app.diff && app.diff->generation == app.diff_generation &&
-        diff_is_current(app.diff, r, &r->rows[sel]))
-        app.sel = sel;  // the file did not change: list_select keeps the open diff
+        diff_is_current(app.diff, r, row_at(diff_sel)))
+        app.diff_sel = diff_sel;  // the file did not change: list_select keeps the open diff
     else if (same_file)
         app.keep_scroll_generation = app.diff_generation + 1;  // the request list_select makes below
     if (!r->auto_refresh)
         clear_diff();
-    list_select(sel, 1);
+    if (sel_found && row_at(sel)->folder) {
+        if (same_file)
+            list_select(diff_sel, 1, 1);  // reloads the open file if it changed
+        else
+            clear_diff();  // the open file is gone
+    }
+    list_select(sel, 1, !sel_found);
 }
 
 static void on_diff(DiffResult *r)
@@ -2242,6 +2330,8 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         POINT p = {(short)LOWORD(lp), (short)HIWORD(lp)};
         if (PtInRect(&app.list_button, p))
             toggle_list();
+        if (PtInRect(&app.tree_toggle, p) && (p.x >= (app.tree_toggle.left + app.tree_toggle.right) / 2) != app.tree)
+            toggle_tree();
         if (PtInRect(&app.toggle, p) && (p.x >= (app.toggle.left + app.toggle.right) / 2) != app.side_by_side)
             toggle_view();
         if (PtInRect(&app.nav, p))
@@ -2383,7 +2473,7 @@ static int run(void)
         fatal(L"RegisterClass");
 
     app.loading = 1;
-    app.sel = -1;
+    app.sel = app.diff_sel = -1;
     app.side_by_side = 1;
     app.side_split = 500;
     app.change_row = -1;
